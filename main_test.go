@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 )
 
 func TestUpgradeInstallsLatestRelease(t *testing.T) {
@@ -64,5 +65,26 @@ func TestUpgradeInstallsLatestRelease(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(home, ".local", "bin", exe))
 	if err != nil || string(got) != "new binary" {
 		t.Fatalf("installed binary = %q, %v", got, err)
+	}
+}
+
+func TestNewRunsIgnoresRunsThatStartedBeforeTheDispatch(t *testing.T) {
+	cutoff := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	runs := []workflowRun{
+		{DatabaseID: 9, CreatedAt: cutoff.Add(-5 * time.Minute)}, // started while gh was prompting
+		{DatabaseID: 5, CreatedAt: cutoff.Add(-time.Hour)},       // known
+		{DatabaseID: 7, CreatedAt: cutoff.Add(time.Second)},      // ours
+	}
+	got := newRuns(runs, map[int64]bool{5: true}, cutoff)
+	if len(got) != 1 || got[0].DatabaseID != 7 {
+		t.Fatalf("newRuns = %+v, want only run 7", got)
+	}
+}
+
+func TestDateHeader(t *testing.T) {
+	resp := "HTTP/2.0 200 OK\nContent-Type: application/json\nDate: Mon, 05 Oct 2026 12:00:01 GMT\n\n{\"a\": \"Date: nope\"}"
+	got, ok := dateHeader(resp)
+	if !ok || !got.Equal(time.Date(2026, 10, 5, 12, 0, 1, 0, time.UTC)) {
+		t.Fatalf("dateHeader = %v, %v", got, ok)
 	}
 }

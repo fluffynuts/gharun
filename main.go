@@ -42,6 +42,7 @@ const (
 	statePollInterval    = 5 * time.Second
 	discoverPollInterval = 3 * time.Second
 	discoverTimeout      = 90 * time.Second
+	discoverSlack        = 20 * time.Second
 	maxConsecutiveErrors = 5
 	releaseURL           = "https://github.com/fluffynuts/gharun/releases/latest/download"
 	snapshotLimit        = "50"
@@ -56,11 +57,12 @@ var (
 )
 
 type workflowRun struct {
-	DatabaseID   int64  `json:"databaseId"`
-	Status       string `json:"status"`
-	Conclusion   string `json:"conclusion"`
-	URL          string `json:"url"`
-	WorkflowName string `json:"workflowName"`
+	DatabaseID   int64     `json:"databaseId"`
+	Status       string    `json:"status"`
+	Conclusion   string    `json:"conclusion"`
+	URL          string    `json:"url"`
+	WorkflowName string    `json:"workflowName"`
+	CreatedAt    time.Time `json:"createdAt"`
 }
 
 func main() {
@@ -130,8 +132,14 @@ func run(args []string) int {
 		return code
 	}
 
+	// gh prompts for the workflow and its inputs before it dispatches, which
+	// can take minutes; any other run that started meanwhile is not ours. Ours
+	// was created just before gh exited, so only runs created from about now
+	// (by GitHub's clock) are candidates.
+	cutoff := githubNow().Add(-discoverSlack)
+
 	fmt.Println(dim.Render("Waiting for the run to appear..."))
-	newRun, err := discoverRun(ref, user, known)
+	newRun, err := discoverRun(ref, user, known, cutoff)
 	if err != nil {
 		fail(err.Error())
 		return 1
@@ -494,21 +502,58 @@ func dispatch(ref string, extra []string) int {
 	return 0
 }
 
-func discoverRun(ref string, user string, known map[int64]bool) (workflowRun, error) {
+// githubNow is the current time by GitHub's clock (the Date header of an API
+// response), which avoids local clock skew; it falls back to the local clock.
+func githubNow() time.Time {
+	out, err := ghOutput("api", "-i", "rate_limit")
+	if err == nil {
+		if t, ok := dateHeader(out); ok {
+			return t
+		}
+	}
+	return time.Now()
+}
+
+func dateHeader(response string) (time.Time, bool) {
+	for _, line := range strings.Split(response, "\n") {
+		name, value, found := strings.Cut(line, ":")
+		if !found {
+			// the body follows the first blank line; stop looking
+			if strings.TrimSpace(line) == "" {
+				break
+			}
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(name), "Date") {
+			t, err := http.ParseTime(strings.TrimSpace(value))
+			return t, err == nil
+		}
+	}
+	return time.Time{}, false
+}
+
+// newRuns are the runs not in known that were created at or after cutoff,
+// newest first.
+func newRuns(runs []workflowRun, known map[int64]bool, cutoff time.Time) []workflowRun {
+	var fresh []workflowRun
+	for _, r := range runs {
+		if !known[r.DatabaseID] && !r.CreatedAt.Before(cutoff) {
+			fresh = append(fresh, r)
+		}
+	}
+	sort.Slice(fresh, func(i int, j int) bool {
+		return fresh[i].DatabaseID > fresh[j].DatabaseID
+	})
+	return fresh
+}
+
+func discoverRun(ref string, user string, known map[int64]bool, cutoff time.Time) (workflowRun, error) {
 	deadline := time.Now().Add(discoverTimeout)
 	for time.Now().Before(deadline) {
 		runs, err := listRuns(ref, user, discoverLimit)
 		if err == nil {
-			var fresh []workflowRun
-			for _, r := range runs {
-				if !known[r.DatabaseID] {
-					fresh = append(fresh, r)
-				}
-			}
+			fresh := newRuns(runs, known, cutoff)
 			if len(fresh) > 0 {
-				sort.Slice(fresh, func(i int, j int) bool {
-					return fresh[i].DatabaseID > fresh[j].DatabaseID
-				})
 				if len(fresh) > 1 {
 					fmt.Fprintln(os.Stderr, yellow.Render(fmt.Sprintf(
 						"Warning: %d new runs appeared on %s; watching the newest", len(fresh), ref)))
@@ -580,7 +625,7 @@ func listRuns(ref string, user string, limit string) ([]workflowRun, error) {
 		"--event", "workflow_dispatch",
 		"--user", user,
 		"--limit", limit,
-		"--json", "databaseId,status,conclusion,url,workflowName")
+		"--json", "databaseId,status,conclusion,url,workflowName,createdAt")
 	if err != nil {
 		return nil, err
 	}
