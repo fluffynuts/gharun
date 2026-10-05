@@ -6,6 +6,7 @@
 //     completes, printing the run URL and SUCCESS (green) or FAILED (red)
 //
 // Any extra arguments are passed through to `gh workflow run`.
+// --install copies this binary to ~/.local/bin (warning if that isn't on PATH).
 // If --ref/-r is supplied, the branch prompt is skipped.
 // Before dispatching, the checked-out branch must exist on the remote (else
 // exit 1), and uncommitted or unpushed work needs confirming.
@@ -17,9 +18,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -57,6 +61,10 @@ func main() {
 }
 
 func run(args []string) int {
+	if wantsInstall(args) {
+		return install()
+	}
+
 	if _, err := exec.LookPath("gh"); err != nil {
 		fail("gh CLI not found on PATH")
 		return 1
@@ -122,6 +130,111 @@ func run(args []string) int {
 	fmt.Println(dim.Render("(Ctrl-C stops watching; the run itself keeps going)"))
 
 	return watch(newRun.DatabaseID)
+}
+
+// wantsInstall reports whether --install appears before any "--" (after which
+// arguments belong to gh).
+func wantsInstall(args []string) bool {
+	for _, a := range args {
+		if a == "--" {
+			return false
+		}
+		if a == "--install" {
+			return true
+		}
+	}
+	return false
+}
+
+// install copies the running binary into ~/.local/bin and warns if that
+// folder isn't on PATH.
+func install() int {
+	self, err := os.Executable()
+	if err != nil {
+		fail(err.Error())
+		return 1
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fail(err.Error())
+		return 1
+	}
+	dir := filepath.Join(home, ".local", "bin")
+	name := "gharun"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	dest := filepath.Join(dir, name)
+
+	if same, _ := sameFile(self, dest); same {
+		fmt.Println(dim.Render(dest + " is this binary already; nothing to copy"))
+	} else {
+		if err := copyExecutable(self, dest); err != nil {
+			fail(err.Error())
+			return 1
+		}
+		fmt.Println(green.Render("Installed " + dest))
+	}
+
+	if !dirOnPath(dir) {
+		fmt.Fprintln(os.Stderr, yellow.Render(fmt.Sprintf(
+			"Warning: %s is not in your PATH; add it (e.g. export PATH=\"$HOME/.local/bin:$PATH\") to run gharun by name", dir)))
+	}
+	return 0
+}
+
+func sameFile(a, b string) (bool, error) {
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false, err
+	}
+	bi, err := os.Stat(b)
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(ai, bi), nil
+}
+
+// copyExecutable writes src to a temp file beside dest and renames it into
+// place, so replacing a binary that is running (or being read) is safe.
+func copyExecutable(src, dest string) (err error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dest), ".gharun-install-*")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			os.Remove(tmp.Name())
+		}
+	}()
+	if _, err = io.Copy(tmp, in); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if err = os.Chmod(tmp.Name(), 0o755); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), dest)
+}
+
+func dirOnPath(dir string) bool {
+	for _, p := range filepath.SplitList(os.Getenv("PATH")) {
+		if filepath.Clean(p) == filepath.Clean(dir) {
+			return true
+		}
+	}
+	return false
 }
 
 // preflight checks the checked-out branch before anything is dispatched: the
