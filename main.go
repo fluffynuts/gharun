@@ -10,7 +10,8 @@
 // Arguments after "--" are passed through to `gh workflow run`; unknown
 // arguments before it show the help and exit 2 (see helpText).
 // --version prints the version, commit and build time.
-// --install copies this binary to ~/.local/bin (warning if that isn't on PATH).
+// --install copies this binary to ~/.local/bin (warning if that isn't on PATH;
+// on Windows, adding it to the user's PATH instead).
 // Every run, dispatched or watched, ends with a system notification (best effort).
 // --watch <run url> just watches that run to completion.
 // --capture asks for a name, runs as usual and saves the dispatch (minus the
@@ -401,10 +402,31 @@ func installTo(src, dest string) int {
 	}
 
 	if dir := filepath.Dir(dest); !dirOnPath(dir) {
-		fmt.Fprintln(os.Stderr, yellow.Render(fmt.Sprintf(
-			"Warning: %s is not in your PATH; add it (e.g. export PATH=\"$HOME/.local/bin:$PATH\") to run gharun by name", dir)))
+		warnNotOnPath(dir)
 	}
 	return 0
+}
+
+// warnNotOnPath says dir isn't on PATH. On Windows it adds dir to the user's
+// PATH instead, which only terminals started afterwards will see.
+func warnNotOnPath(dir string) {
+	if runtime.GOOS != "windows" {
+		fmt.Fprintln(os.Stderr, yellow.Render(fmt.Sprintf(
+			"Warning: %s is not in your PATH; add it (e.g. export PATH=\"$HOME/.local/bin:$PATH\") to run gharun by name", dir)))
+		return
+	}
+	added, err := addToUserPath(dir)
+	switch {
+	case err != nil:
+		fmt.Fprintln(os.Stderr, yellow.Render(fmt.Sprintf(
+			"Warning: %s is not in your PATH and adding it failed (%v); add it yourself to run gharun by name", dir, err)))
+	case added:
+		fmt.Fprintln(os.Stderr, yellow.Render(fmt.Sprintf(
+			"Added %s to your user PATH; restart your terminal to run gharun by name", dir)))
+	default:
+		fmt.Fprintln(os.Stderr, yellow.Render(fmt.Sprintf(
+			"%s is in your user PATH but not this terminal's; restart your terminal to run gharun by name", dir)))
+	}
 }
 
 // upgrade downloads the latest release's zip for this OS/arch, checks it
@@ -561,7 +583,8 @@ func copyExecutable(src, dest string) (err error) {
 
 func dirOnPath(dir string) bool {
 	for _, p := range filepath.SplitList(os.Getenv("PATH")) {
-		if filepath.Clean(p) == filepath.Clean(dir) {
+		p, dir := filepath.Clean(p), filepath.Clean(dir)
+		if p == dir || (runtime.GOOS == "windows" && strings.EqualFold(p, dir)) {
 			return true
 		}
 	}
@@ -1188,7 +1211,8 @@ Options:
                        it completes, then report SUCCESS or FAILED (exit 0 or 1)
       --version        print the version and exit
       --install        copy this binary to ~/.local/bin and exit; warns if that
-                       folder is not in your PATH
+                       folder is not in your PATH (on Windows, adds it to your
+                       user PATH instead)
       --upgrade        download the latest release for this machine, install it
                        over the gharun found in your PATH (or to ~/.local/bin if
                        there isn't one) and exit
