@@ -5,7 +5,8 @@
 //  3. finds the run that dispatch created and polls it every 5s until it
 //     completes, printing the run URL and SUCCESS (green) or FAILED (red)
 //
-// Any extra arguments are passed through to `gh workflow run`.
+// Arguments after "--" are passed through to `gh workflow run`; unknown
+// arguments before it show the help and exit 2 (see helpText).
 // --version prints the version, commit and build time.
 // --install copies this binary to ~/.local/bin (warning if that isn't on PATH).
 // --upgrade downloads the latest release for this machine and installs it.
@@ -110,14 +111,22 @@ func main() {
 }
 
 func run(args []string) int {
-	if hasFlag(args, "--version") {
+	opts, err := parseArgs(args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, red.Render("error: "+err.Error()))
+		fmt.Fprint(os.Stderr, "\n"+helpText)
+		return 2
+	}
+	switch {
+	case opts.help:
+		fmt.Print(helpText)
+		return 0
+	case opts.version:
 		fmt.Println(versionString())
 		return 0
-	}
-	if hasFlag(args, "--install") {
+	case opts.install:
 		return install()
-	}
-	if hasFlag(args, "--upgrade") {
+	case opts.upgrade:
 		return upgrade()
 	}
 
@@ -126,14 +135,14 @@ func run(args []string) int {
 		return 1
 	}
 
-	repo, args, hasRepo := extractFlag(args, "-R", "--repo")
+	hasRepo := opts.repo != ""
 	if hasRepo {
 		// gh honours GH_REPO for api placeholders, run list and run view alike,
 		// so every call below targets the same repository.
-		os.Setenv("GH_REPO", repo)
+		os.Setenv("GH_REPO", opts.repo)
 	}
 
-	ref, args, hasRef := extractFlag(args, "-r", "--ref")
+	ref, hasRef := opts.ref, opts.ref != ""
 	// The local checkout says nothing about a different repo (-R).
 	if !hasRepo {
 		if code, stop := preflight(ref, hasRef); stop {
@@ -172,7 +181,7 @@ func run(args []string) int {
 	}
 
 	fmt.Println(dim.Render(fmt.Sprintf("Dispatching against ref: %s", ref)))
-	if code := dispatch(ref, args); code != 0 {
+	if code := dispatch(ref, opts.passthrough); code != 0 {
 		return code
 	}
 
@@ -192,20 +201,6 @@ func run(args []string) int {
 	fmt.Println(dim.Render("(Ctrl-C stops watching; the run itself keeps going)"))
 
 	return watch(newRun.DatabaseID)
-}
-
-// hasFlag reports whether flag appears before any "--" (after which
-// arguments belong to gh).
-func hasFlag(args []string, flag string) bool {
-	for _, a := range args {
-		if a == "--" {
-			return false
-		}
-		if a == flag {
-			return true
-		}
-	}
-	return false
 }
 
 // install copies the running binary into ~/.local/bin and warns if that
@@ -751,42 +746,105 @@ func listRuns(ref string, user string, limit string) ([]workflowRun, error) {
 	return runs, nil
 }
 
-// extractFlag pulls a string flag out of args in any pflag form:
-// "-r x", "-rx", "-r=x", "--ref x", "--ref=x". Parsing stops at "--".
-func extractFlag(args []string, short string, long string) (string, []string, bool) {
-	rest := make([]string, 0, len(args))
-	value := ""
-	found := false
+// options are gharun's own command line. Everything after "--" is kept
+// verbatim in passthrough for `gh workflow run`.
+type options struct {
+	help, version, install, upgrade bool
+	ref, repo                       string
+	passthrough                     []string
+}
+
+const helpText = `gharun - dispatch a GitHub workflow on a branch and watch it run
+
+Usage:
+  gharun [options] [-- <gh workflow run arguments>]
+
+Without --ref, gharun asks which remote branch to run against (the checked-out
+branch is the default). It then runs "gh workflow run --ref <branch>", which
+prompts for the workflow and its inputs as usual, finds the run it created and
+shows its status on one updating line until it completes. Exit status is 0 if
+the run succeeded and 1 if it failed.
+
+Options:
+  -r, --ref <branch>   run against this branch; skips the branch prompt
+  -R, --repo <o/r>     use this repository (OWNER/REPO) instead of the current
+                       one; skips the local uncommitted/unpushed checks
+      --version        print the version and exit
+      --install        copy this binary to ~/.local/bin and exit; warns if that
+                       folder is not in your PATH
+      --upgrade        download the latest release for this machine, install it
+                       to ~/.local/bin and exit
+  -h, --help           show this help and exit
+
+Passing arguments to gh workflow run:
+  Anything after a bare "--" is handed to "gh workflow run" untouched. Without
+  the "--", unknown arguments are an error and show this help.
+
+  gharun -- deploy.yml                          name the workflow
+  gharun -- deploy.yml -f environment=staging   string input
+  gharun -r staging -- deploy.yml -F debug=true typed input, on a chosen branch
+
+  gharun already passes --ref, so don't repeat it after the "--"; use -r.
+`
+
+// parseArgs reads gharun's own options in any pflag form ("-r x", "-rx",
+// "-r=x", "--ref x", "--ref=x") and stops at "--". An unknown argument, or a
+// value-taking option without its value, is an error.
+func parseArgs(args []string) (options, error) {
+	var o options
+	value := func(i *int, a, short, long string) (string, bool) {
+		switch {
+		case a == short || a == long:
+			if *i+1 < len(args) {
+				*i++
+				return args[*i], true
+			}
+			return "", false
+		case strings.HasPrefix(a, long+"="):
+			return strings.TrimPrefix(a, long+"="), true
+		case strings.HasPrefix(a, short+"="):
+			return strings.TrimPrefix(a, short+"="), true
+		case strings.HasPrefix(a, short) && !strings.HasPrefix(a, "--"):
+			return strings.TrimPrefix(a, short), true
+		}
+		return "", false
+	}
+	matches := func(a, short, long string) bool {
+		return a == short || a == long || strings.HasPrefix(a, long+"=") ||
+			(strings.HasPrefix(a, short) && !strings.HasPrefix(a, "--"))
+	}
 
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		if a == "--" {
-			rest = append(rest, args[i:]...)
-			break
-		}
 		switch {
-		case a == short || a == long:
-			if i+1 < len(args) {
-				value = args[i+1]
-				found = true
-				i++
-				continue
+		case a == "--":
+			o.passthrough = args[i+1:]
+			return o, nil
+		case a == "-h" || a == "--help":
+			o.help = true
+		case a == "--version":
+			o.version = true
+		case a == "--install":
+			o.install = true
+		case a == "--upgrade":
+			o.upgrade = true
+		case matches(a, "-r", "--ref"):
+			v, ok := value(&i, a, "-r", "--ref")
+			if !ok || v == "" {
+				return o, fmt.Errorf("%s needs a branch", a)
 			}
-			rest = append(rest, a)
-		case strings.HasPrefix(a, long+"="):
-			value = strings.TrimPrefix(a, long+"=")
-			found = true
-		case strings.HasPrefix(a, short+"="):
-			value = strings.TrimPrefix(a, short+"=")
-			found = true
-		case strings.HasPrefix(a, short) && !strings.HasPrefix(a, "--") && len(a) > len(short):
-			value = strings.TrimPrefix(a, short)
-			found = true
+			o.ref = v
+		case matches(a, "-R", "--repo"):
+			v, ok := value(&i, a, "-R", "--repo")
+			if !ok || v == "" {
+				return o, fmt.Errorf("%s needs OWNER/REPO", a)
+			}
+			o.repo = v
 		default:
-			rest = append(rest, a)
+			return o, fmt.Errorf("unknown argument %q", a)
 		}
 	}
-	return value, rest, found
+	return o, nil
 }
 
 func ghOutput(args ...string) (string, error) {

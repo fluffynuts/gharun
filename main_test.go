@@ -101,3 +101,18 @@ func TestFormatClock(t *testing.T) {
 		}
 	}
 }
+
+func TestParseArgs(t *testing.T) {
+	o, err := parseArgs([]string{"-r", "staging", "-Rfoo/bar", "--version", "--", "deploy.yml", "-r", "x", "--bogus"})
+	if err != nil || o.ref != "staging" || o.repo != "foo/bar" || !o.version {
+		t.Fatalf("parseArgs = %+v, %v", o, err)
+	}
+	if got := fmt.Sprint(o.passthrough); got != "[deploy.yml -r x --bogus]" {
+		t.Fatalf("passthrough = %s", got)
+	}
+	for _, bad := range [][]string{{"deploy.yml"}, {"--bogus"}, {"-r"}, {"--ref="}, {"-f", "a=b"}} {
+		if _, err := parseArgs(bad); err == nil {
+			t.Errorf("parseArgs(%v) accepted bad arguments", bad)
+		}
+	}
+}
