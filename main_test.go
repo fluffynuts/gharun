@@ -88,3 +88,16 @@ func TestDateHeader(t *testing.T) {
 		t.Fatalf("dateHeader = %v, %v", got, ok)
 	}
 }
+
+func TestFormatClock(t *testing.T) {
+	for d, want := range map[time.Duration]string{
+		0:                                     "00:00",
+		31*time.Second + 900*time.Millisecond: "00:31",
+		754 * time.Second:                     "12:34",
+		3661 * time.Second:                    "1:01:01",
+	} {
+		if got := formatClock(d); got != want {
+			t.Errorf("formatClock(%v) = %q, want %q", d, got, want)
+		}
+	}
+}

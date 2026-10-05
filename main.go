@@ -6,6 +6,7 @@
 //     completes, printing the run URL and SUCCESS (green) or FAILED (red)
 //
 // Any extra arguments are passed through to `gh workflow run`.
+// --version prints the version, commit and build time.
 // --install copies this binary to ~/.local/bin (warning if that isn't on PATH).
 // --upgrade downloads the latest release for this machine and installs it.
 // If --ref/-r is supplied, the branch prompt is skipped.
@@ -30,6 +31,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -56,6 +58,44 @@ var (
 	yellow = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 )
 
+// Set at build time by make.sh/make.ps1/Makefile (-X main.Version=... etc).
+var (
+	Version = ""
+	Build   = ""
+	Commit  = ""
+	BuiltAt = ""
+)
+
+// versionString is "gharun 0.1.2 (abc1234 built at 2026-10-05T12:00:00Z)".
+// Anything not injected at build time falls back to what the go tool embeds
+// (the commit) or "unknown".
+func versionString() string {
+	version := Version
+	if version == "" {
+		version = "dev"
+	} else if Build != "" {
+		version += "." + Build
+	}
+	commit := Commit
+	if commit == "" {
+		if info, ok := debug.ReadBuildInfo(); ok {
+			for _, setting := range info.Settings {
+				if setting.Key == "vcs.revision" && len(setting.Value) >= 7 {
+					commit = setting.Value[:7]
+				}
+			}
+		}
+	}
+	if commit == "" {
+		commit = "unknown"
+	}
+	builtAt := BuiltAt
+	if builtAt == "" {
+		builtAt = "unknown"
+	}
+	return fmt.Sprintf("gharun %s (%s built at %s)", version, commit, builtAt)
+}
+
 type workflowRun struct {
 	DatabaseID   int64     `json:"databaseId"`
 	Status       string    `json:"status"`
@@ -70,6 +110,10 @@ func main() {
 }
 
 func run(args []string) int {
+	if hasFlag(args, "--version") {
+		fmt.Println(versionString())
+		return 0
+	}
 	if hasFlag(args, "--install") {
 		return install()
 	}
@@ -567,40 +611,93 @@ func discoverRun(ref string, user string, known map[int64]bool, cutoff time.Time
 		"no new workflow_dispatch run appeared on %q within %s", ref, discoverTimeout)
 }
 
+type pollResult struct {
+	run workflowRun
+	err error
+}
+
+// watch polls the run every statePollInterval until it completes. Meanwhile a
+// one-second tick redraws a single status line ("[00:31] in_progress") so the
+// clock keeps moving even though polls are slow; polls run in the background
+// so they never stall it. When stdout isn't a terminal, a line is printed only
+// when the status changes.
 func watch(id int64) int {
 	idStr := fmt.Sprintf("%d", id)
-	lastStatus := ""
-	errorCount := 0
 	started := time.Now()
+	live := isTerminal(os.Stdout)
+
+	status := "waiting"
+	note := ""
+	lastPrinted := ""
+	render := func() {
+		line := fmt.Sprintf("[%s] %s%s", formatClock(time.Since(started)), status, note)
+		if live {
+			fmt.Print("\r\x1b[2K" + dim.Render(line))
+		} else if status != lastPrinted {
+			fmt.Println(dim.Render(line))
+		}
+		lastPrinted = status
+	}
+	// finish ends the status line, leaving its last state on screen.
+	finish := func() {
+		render()
+		if live {
+			fmt.Println()
+		}
+	}
+
+	results := make(chan pollResult, 1)
+	polling := false
+	poll := func() {
+		polling = true
+		go func() {
+			out, err := ghOutput("run", "view", idStr, "--json", "status,conclusion,url,workflowName")
+			var r workflowRun
+			if err == nil {
+				if jerr := json.Unmarshal([]byte(out), &r); jerr != nil {
+					err = fmt.Errorf("parsing run state: %w", jerr)
+				}
+			}
+			results <- pollResult{r, err}
+		}()
+	}
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	nextPoll := time.Now()
+	errorCount := 0
 
 	for {
-		out, err := ghOutput("run", "view", idStr, "--json", "status,conclusion,url,workflowName")
-		if err != nil {
-			errorCount++
-			fmt.Fprintln(os.Stderr, yellow.Render(fmt.Sprintf(
-				"poll error (%d/%d): %v", errorCount, maxConsecutiveErrors, err)))
-			if errorCount >= maxConsecutiveErrors {
-				fail("giving up after repeated poll errors")
-				return 1
+		select {
+		case <-ticker.C:
+			if !polling && !time.Now().Before(nextPoll) {
+				poll()
 			}
-			time.Sleep(statePollInterval)
-			continue
-		}
-		errorCount = 0
+			render()
+		case res := <-results:
+			polling = false
+			nextPoll = time.Now().Add(statePollInterval)
+			if res.err != nil {
+				errorCount++
+				note = fmt.Sprintf(" (poll error %d/%d: %s)", errorCount, maxConsecutiveErrors, firstLine(res.err.Error()))
+				if errorCount >= maxConsecutiveErrors {
+					finish()
+					fail("giving up after repeated poll errors")
+					return 1
+				}
+				render()
+				continue
+			}
+			errorCount = 0
+			note = ""
+			r := res.run
+			status = r.Status
+			render()
 
-		var r workflowRun
-		if err := json.Unmarshal([]byte(out), &r); err != nil {
-			fail(fmt.Sprintf("parsing run state: %v", err))
-			return 1
-		}
-
-		if r.Status != lastStatus {
-			elapsed := time.Since(started).Round(time.Second)
-			fmt.Println(dim.Render(fmt.Sprintf("[%s] status: %s", elapsed, r.Status)))
-			lastStatus = r.Status
-		}
-
-		if r.Status == "completed" {
+			if r.Status != "completed" {
+				continue
+			}
+			finish()
 			if r.Conclusion == "success" {
 				fmt.Println(green.Render(r.URL))
 				fmt.Println(green.Render("SUCCESS"))
@@ -614,9 +711,27 @@ func watch(id int64) int {
 			fmt.Println(red.Render(label))
 			return 1
 		}
-
-		time.Sleep(statePollInterval)
 	}
+}
+
+// formatClock renders d as MM:SS, or H:MM:SS from an hour up.
+func formatClock(d time.Duration) string {
+	total := int(d.Seconds())
+	h, m, sec := total/3600, total/60%60, total%60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, sec)
+	}
+	return fmt.Sprintf("%02d:%02d", m, sec)
+}
+
+func firstLine(s string) string {
+	line, _, _ := strings.Cut(s, "\n")
+	return line
+}
+
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
 func listRuns(ref string, user string, limit string) ([]workflowRun, error) {

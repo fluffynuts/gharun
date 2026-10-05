@@ -4,6 +4,9 @@ GO     ?= go
 BINARY ?= gharun
 PKG    := .
 
+# Version info baked into the binary; make.sh does the same for dist.
+LDFLAGS = -X main.Version=$(shell tr -d '[:space:]' < VERSION) -X main.Commit=$(shell git rev-parse --short=7 HEAD 2>/dev/null || echo unknown) -X main.BuiltAt=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+
 SOURCES := $(shell find . -name '*.go' -not -path './.git/*')
 
 .DEFAULT_GOAL := build
@@ -12,7 +15,7 @@ SOURCES := $(shell find . -name '*.go' -not -path './.git/*')
 build: $(BINARY)
 
 $(BINARY): $(SOURCES) go.mod $(wildcard go.sum) VERSION
-	$(GO) build -o $@ $(PKG)
+	$(GO) build -ldflags "$(LDFLAGS)" -o $@ $(PKG)
 
 .PHONY: test
 test:

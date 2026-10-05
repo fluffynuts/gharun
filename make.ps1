@@ -13,6 +13,15 @@ $Name = 'gharun'
 $Go = if ($env:GO) { $env:GO } else { 'go' }
 $Binary = if ($env:BINARY) { $env:BINARY } elseif ($IsWindows -or $env:OS -eq 'Windows_NT') { "$Name.exe" } else { $Name }
 $Pkg = '.'
+# Version info baked into the binary (main.Version etc.); BUILD is the CI build number.
+function Get-LdFlags {
+    $version = (Get-Content VERSION -Raw).Trim()
+    $commit = (& git rev-parse --short=7 HEAD 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $commit) { $commit = 'unknown' }
+    $builtAt = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    "-X main.Version=$version -X main.Build=$($env:BUILD) -X main.Commit=$commit -X main.BuiltAt=$builtAt"
+}
+
 # Extra files shipped beside the binary in each zip; they must exist.
 $Bundle = @('VERSION')
 
@@ -34,7 +43,7 @@ function Invoke-Build {
             return
         }
     }
-    Invoke-Step $Go @('build', '-o', $Binary, $Pkg)
+    Invoke-Step $Go @('build', '-ldflags', (Get-LdFlags), '-o', $Binary, $Pkg)
 }
 
 function Invoke-Test { Invoke-Step $Go @('test', './...') }
@@ -62,7 +71,7 @@ function Invoke-Dist {
     $env:CGO_ENABLED = '0'
     $env:GOOS = $goos
     $env:GOARCH = $goarch
-    Invoke-Step $Go @('build', '-trimpath', '-ldflags', "-X main.Version=$version -X main.Build=$($env:BUILD)", '-o', (Join-Path $stage $exe), $Pkg)
+    Invoke-Step $Go @('build', '-trimpath', '-ldflags', (Get-LdFlags), '-o', (Join-Path $stage $exe), $Pkg)
     Copy-Item -Recurse $Bundle $stage
     Compress-Archive -Path $stage -DestinationPath $zip
     Remove-Item -Recurse -Force $stage

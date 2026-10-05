@@ -20,6 +20,13 @@ BINARY="${BINARY:-gharun}"
 PKG="."
 NAME="gharun"
 
+# Version info baked into the binary (main.Version etc.); BUILD is the CI build number.
+ldflags() {
+  local commit
+  commit="$(git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)"
+  echo "-X main.Version=$(tr -d '[:space:]' <VERSION) -X main.Build=${BUILD:-} -X main.Commit=$commit -X main.BuiltAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
 # Extra files shipped beside the binary in each zip; they must exist.
 BUNDLE=(VERSION)
 
@@ -31,7 +38,7 @@ target_build() {
     return
   fi
   echo "$GO build -o $BINARY $PKG"
-  "$GO" build -o "$BINARY" "$PKG"
+  "$GO" build -ldflags "$(ldflags)" -o "$BINARY" "$PKG"
 }
 
 target_test() {
@@ -65,7 +72,7 @@ target_dist() {
   mkdir -p "$stage"
   echo "GOOS=$goos GOARCH=$goarch $GO build -o $stage/$exe $PKG" >&2
   CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" "$GO" build -trimpath \
-    -ldflags "-X main.Version=$(tr -d '[:space:]' <VERSION) -X main.Build=${BUILD:-}" \
+    -ldflags "$(ldflags)" \
     -o "$stage/$exe" "$PKG" >&2
   cp -R "${BUNDLE[@]}" "$stage/"
   (cd dist && zip -qrX "$name.zip" "$name") >&2
