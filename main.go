@@ -7,6 +7,7 @@
 //
 // Any extra arguments are passed through to `gh workflow run`.
 // --install copies this binary to ~/.local/bin (warning if that isn't on PATH).
+// --upgrade downloads the latest release for this machine and installs it.
 // If --ref/-r is supplied, the branch prompt is skipped.
 // Before dispatching, the checked-out branch must exist on the remote (else
 // exit 1), and uncommitted or unpushed work needs confirming.
@@ -14,14 +15,19 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -37,6 +43,7 @@ const (
 	discoverPollInterval = 3 * time.Second
 	discoverTimeout      = 90 * time.Second
 	maxConsecutiveErrors = 5
+	releaseURL           = "https://github.com/fluffynuts/gharun/releases/latest/download"
 	snapshotLimit        = "50"
 	discoverLimit        = "20"
 )
@@ -61,8 +68,11 @@ func main() {
 }
 
 func run(args []string) int {
-	if wantsInstall(args) {
+	if hasFlag(args, "--install") {
 		return install()
+	}
+	if hasFlag(args, "--upgrade") {
+		return upgrade()
 	}
 
 	if _, err := exec.LookPath("gh"); err != nil {
@@ -132,14 +142,14 @@ func run(args []string) int {
 	return watch(newRun.DatabaseID)
 }
 
-// wantsInstall reports whether --install appears before any "--" (after which
+// hasFlag reports whether flag appears before any "--" (after which
 // arguments belong to gh).
-func wantsInstall(args []string) bool {
+func hasFlag(args []string, flag string) bool {
 	for _, a := range args {
 		if a == "--" {
 			return false
 		}
-		if a == "--install" {
+		if a == flag {
 			return true
 		}
 	}
@@ -154,6 +164,11 @@ func install() int {
 		fail(err.Error())
 		return 1
 	}
+	return installFrom(self)
+}
+
+// installFrom copies the binary at src into ~/.local/bin.
+func installFrom(src string) int {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		fail(err.Error())
@@ -166,10 +181,10 @@ func install() int {
 	}
 	dest := filepath.Join(dir, name)
 
-	if same, _ := sameFile(self, dest); same {
+	if same, _ := sameFile(src, dest); same {
 		fmt.Println(dim.Render(dest + " is this binary already; nothing to copy"))
 	} else {
-		if err := copyExecutable(self, dest); err != nil {
+		if err := copyExecutable(src, dest); err != nil {
 			fail(err.Error())
 			return 1
 		}
@@ -181,6 +196,110 @@ func install() int {
 			"Warning: %s is not in your PATH; add it (e.g. export PATH=\"$HOME/.local/bin:$PATH\") to run gharun by name", dir)))
 	}
 	return 0
+}
+
+// upgrade downloads the latest release's zip for this OS/arch, checks it
+// against the release's SHA256SUMS, and installs the binary inside it.
+func upgrade() int {
+	osName := runtime.GOOS
+	if osName == "darwin" {
+		osName = "macos"
+	}
+	asset := fmt.Sprintf("gharun-%s-%s.zip", osName, runtime.GOARCH)
+	base := os.Getenv("GHARUN_RELEASE_URL")
+	if base == "" {
+		base = releaseURL
+	}
+
+	fmt.Println(dim.Render("Downloading " + base + "/" + asset))
+	zipData, err := httpGet(base + "/" + asset)
+	if err != nil {
+		fail(err.Error())
+		return 1
+	}
+	sums, err := httpGet(base + "/SHA256SUMS")
+	if err != nil {
+		fail(err.Error())
+		return 1
+	}
+	if err := verifyChecksum(asset, zipData, string(sums)); err != nil {
+		fail(err.Error())
+		return 1
+	}
+
+	exe := "gharun"
+	if runtime.GOOS == "windows" {
+		exe += ".exe"
+	}
+	dir, err := os.MkdirTemp("", "gharun-upgrade-*")
+	if err != nil {
+		fail(err.Error())
+		return 1
+	}
+	defer os.RemoveAll(dir)
+	extracted := filepath.Join(dir, exe)
+	if err := extractBinary(zipData, exe, extracted); err != nil {
+		fail(err.Error())
+		return 1
+	}
+	return installFrom(extracted)
+}
+
+func httpGet(url string) ([]byte, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s: %s", url, resp.Status)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// verifyChecksum looks name up in sha256sum-format sums and compares.
+func verifyChecksum(name string, data []byte, sums string) error {
+	sum := sha256.Sum256(data)
+	got := hex.EncodeToString(sum[:])
+	for _, line := range nonEmptyLines(sums) {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && strings.TrimPrefix(fields[1], "*") == name {
+			if strings.EqualFold(fields[0], got) {
+				return nil
+			}
+			return fmt.Errorf("checksum mismatch for %s: expected %s, got %s", name, fields[0], got)
+		}
+	}
+	return fmt.Errorf("%s is not listed in SHA256SUMS", name)
+}
+
+// extractBinary writes the zip entry whose base name is exe to dest. Only that
+// one entry is read, and only to dest, whatever paths the zip holds.
+func extractBinary(zipData []byte, exe, dest string) error {
+	zr, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
+	if err != nil {
+		return err
+	}
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() || path.Base(f.Name) != exe {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		defer rc.Close()
+		out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(out, rc); err != nil {
+			out.Close()
+			return err
+		}
+		return out.Close()
+	}
+	return fmt.Errorf("no %s found in the downloaded zip", exe)
 }
 
 func sameFile(a, b string) (bool, error) {
