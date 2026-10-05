@@ -5,10 +5,14 @@
 //  3. finds the run that dispatch created and polls it every 5s until it
 //     completes, printing the run URL and SUCCESS (green) or FAILED (red)
 //
+// After dispatching it prints the equivalent "gh workflow run ..." command,
+// read from gh's own API log (GH_DEBUG=api).
 // Arguments after "--" are passed through to `gh workflow run`; unknown
 // arguments before it show the help and exit 2 (see helpText).
 // --version prints the version, commit and build time.
 // --install copies this binary to ~/.local/bin (warning if that isn't on PATH).
+// --capture asks for a name, runs as usual and saves the dispatch (minus the
+// branch) as a recipe; next time, a menu offers the repository's recipes (see recipe.go).
 // --upgrade downloads the latest release for this machine and installs it.
 // If --ref/-r is supplied, the branch prompt is skipped.
 // Before dispatching, the checked-out branch must exist on the remote (else
@@ -31,6 +35,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"sort"
@@ -149,6 +154,47 @@ func run(args []string) int {
 			return code
 		}
 	}
+	// Recipes belong to this checkout's origin remote.
+	var recipeRepo, captureName string
+	var chosenRecipe *recipe
+	switch {
+	case opts.capture && hasRepo:
+		fail("--capture needs a local checkout; it can't be combined with --repo")
+		return 1
+	case opts.capture:
+		key, err := originKey()
+		if err != nil {
+			fail(err.Error())
+			return 1
+		}
+		recipeRepo = key
+		name, err := promptRecipeName(key)
+		if err != nil {
+			if errors.Is(err, huh.ErrUserAborted) {
+				return 130
+			}
+			fail(err.Error())
+			return 1
+		}
+		captureName = name
+	case !hasRepo && len(opts.passthrough) == 0:
+		if key, err := originKey(); err == nil && len(listRecipes(key)) > 0 {
+			r, err := promptRecipe(key)
+			if err != nil {
+				if errors.Is(err, huh.ErrUserAborted) {
+					return 130
+				}
+				fail(err.Error())
+				return 1
+			}
+			chosenRecipe = r
+		}
+	}
+	passthrough := opts.passthrough
+	if chosenRecipe != nil {
+		passthrough = chosenRecipe.ghArgs()
+	}
+
 	if !hasRef {
 		chosen, err := promptForBranch()
 		if err != nil {
@@ -181,8 +227,32 @@ func run(args []string) int {
 	}
 
 	fmt.Println(dim.Render(fmt.Sprintf("Dispatching against ref: %s", ref)))
-	if code := dispatch(ref, opts.passthrough); code != 0 {
+	code, ghLog := dispatch(ref, passthrough)
+	if code != 0 {
 		return code
+	}
+	dispatched, understood := findDispatch(ghLog)
+	if understood {
+		dispatched.Workflow = workflowFile(dispatched)
+		fmt.Println(dim.Render("Equivalent command:"))
+		fmt.Println("  " + dispatched.command())
+		if captureName != "" {
+			r := recipe{Name: captureName, Repo: recipeRepo, Workflow: dispatched.Workflow, Inputs: dispatched.Inputs}
+			if path, err := saveRecipe(r); err != nil {
+				fmt.Fprintln(os.Stderr, yellow.Render("Couldn't save the recipe: "+err.Error()))
+			} else {
+				fmt.Println(green.Render("Saved recipe " + path))
+			}
+		}
+	} else {
+		fmt.Fprintln(os.Stderr, yellow.Render(
+			"Couldn't read the dispatch request from gh's API log, so can't show the exact command."))
+		if captureName != "" {
+			fmt.Fprintln(os.Stderr, yellow.Render("No recipe was saved."))
+		}
+		if path := saveLog(ghLog); path != "" {
+			fmt.Fprintln(os.Stderr, dim.Render("gh's log is in "+path+" (the token is masked)"))
+		}
 	}
 
 	// gh prompts for the workflow and its inputs before it dispatches, which
@@ -196,6 +266,9 @@ func run(args []string) int {
 	if err != nil {
 		fail(err.Error())
 		return 1
+	}
+	if !understood {
+		printBestGuess(ref, passthrough, newRun)
 	}
 	fmt.Printf("Watching %s: %s\n", newRun.WorkflowName, newRun.URL)
 	fmt.Println(dim.Render("(Ctrl-C stops watching; the run itself keeps going)"))
@@ -517,12 +590,18 @@ func promptForBranch() (string, error) {
 // dispatch runs `gh workflow run` attached to the real terminal. gh refuses
 // to prompt when stdout isn't a TTY, so its output is deliberately NOT
 // captured; the run is identified afterwards by ID diffing instead.
-func dispatch(ref string, extra []string) int {
+//
+// stderr is the exception: gh is told to log its API traffic there (GH_DEBUG=api)
+// so the request it finally sends can be read back. That log is returned
+// rather than shown, except for gh's own error message when it fails.
+func dispatch(ref string, extra []string) (int, string) {
 	ghArgs := append([]string{"workflow", "run", "--ref", ref}, extra...)
 	cmd := exec.Command("gh", ghArgs...)
+	var stderr bytes.Buffer
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = &stderr
+	cmd.Env = append(os.Environ(), "GH_DEBUG=api")
 
 	// Ctrl-C goes to the whole foreground process group. Let gh handle it
 	// and observe gh's exit status rather than dying underneath it.
@@ -533,12 +612,206 @@ func dispatch(ref string, extra []string) int {
 	if err := cmd.Run(); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return exitErr.ExitCode()
+			fmt.Fprintln(os.Stderr, ghErrorMessage(stderr.String()))
+			return exitErr.ExitCode(), stderr.String()
 		}
 		fail(fmt.Sprintf("running gh workflow run: %v", err))
-		return 1
+		return 1, stderr.String()
 	}
-	return 0
+	return 0, stderr.String()
+}
+
+// saveLog writes gh's API log to a temp file for diagnosis; "" if it can't.
+func saveLog(log string) string {
+	f, err := os.CreateTemp("", "gharun-gh-log-*.txt")
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	if _, err := f.WriteString(log); err != nil {
+		return ""
+	}
+	return f.Name()
+}
+
+// printBestGuess is the fallback when gh's log couldn't be read: the command
+// built from what is known (the run's workflow, the ref and any flags passed
+// after --). Inputs chosen at gh's prompts aren't known, so it says so.
+func printBestGuess(ref string, passthrough []string, run workflowRun) {
+	repo, err := ghOutput("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner")
+	if err != nil || repo == "" {
+		return
+	}
+	owner, name, _ := strings.Cut(repo, "/")
+	workflow := ""
+	if out, err := ghOutput("run", "view", fmt.Sprint(run.DatabaseID), "--json", "workflowDatabaseId", "--jq", ".workflowDatabaseId"); err == nil {
+		workflow = out
+	}
+	if workflow == "" {
+		return
+	}
+	d := dispatchRequest{Owner: owner, Repo: name, Workflow: workflowFile(dispatchRequest{Owner: owner, Repo: name, Workflow: workflow}), Ref: ref}
+	cmd := d.command()
+	if len(passthrough) > 0 && !strings.HasPrefix(passthrough[0], "-") {
+		passthrough = passthrough[1:] // the workflow, already named above
+	}
+	for _, a := range passthrough {
+		cmd += " " + shellQuote(a)
+	}
+	fmt.Println(dim.Render("Best guess at the command (inputs entered at gh's prompts are not included):"))
+	fmt.Println("  " + cmd)
+}
+
+// promptRecipeName asks what to call the recipe being captured, and checks
+// before an existing one of that name is replaced.
+func promptRecipeName(repoKey string) (string, error) {
+	existing := listRecipes(repoKey)
+	var name string
+	err := huh.NewInput().
+		Title("Name for this recipe").
+		Description("Saved for " + repoKey + "; the branch is asked for each time it runs").
+		Validate(validRecipeName).
+		Value(&name).
+		Run()
+	if err != nil {
+		return "", err
+	}
+	if contains(existing, name) {
+		replace := false
+		err := huh.NewConfirm().Title(fmt.Sprintf("A recipe called %q exists. Replace it?", name)).Value(&replace).Run()
+		if err != nil {
+			return "", err
+		}
+		if !replace {
+			return promptRecipeName(repoKey)
+		}
+	}
+	return name, nil
+}
+
+const interactiveChoice = "interactive"
+
+// promptRecipe offers this repository's recipes, with "interactive" (gh's own
+// prompts) first. It returns nil for interactive.
+func promptRecipe(repoKey string) (*recipe, error) {
+	choice := interactiveChoice
+	names := listRecipes(repoKey)
+	options := append([]string{interactiveChoice}, names...)
+	if err := huh.NewSelect[string]().
+		Title("Run Github Action:").
+		Options(huh.NewOptions(options...)...).
+		Value(&choice).
+		Run(); err != nil {
+		return nil, err
+	}
+	if choice == interactiveChoice {
+		return nil, nil
+	}
+	r, err := loadRecipe(repoKey, choice)
+	if err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// workflowFile is the workflow's file name (build.yml) if GitHub will say,
+// else the numeric id gh dispatched to; either works with gh workflow run.
+func workflowFile(d dispatchRequest) string {
+	path, err := ghOutput("api", fmt.Sprintf("repos/%s/%s/actions/workflows/%s", d.Owner, d.Repo, d.Workflow), "--jq", ".path")
+	if err != nil || path == "" {
+		return d.Workflow
+	}
+	return filepath.Base(path)
+}
+
+// ghErrorMessage is what gh printed after its last logged API call (its error
+// message), or everything if there is no such tail.
+func ghErrorMessage(log string) string {
+	log = ansiColour.ReplaceAllString(log, "")
+	if i := strings.LastIndex(log, "* Request took"); i >= 0 {
+		if _, tail, ok := strings.Cut(log[i:], "\n"); ok && strings.TrimSpace(tail) != "" {
+			return strings.TrimSpace(tail)
+		}
+	}
+	return strings.TrimSpace(log)
+}
+
+var (
+	ansiColour   = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	dispatchPath = regexp.MustCompile(`^> POST \S*?/repos/([^/]+)/([^/]+)/actions/workflows/([^/?\s]+)/dispatches`)
+)
+
+// dispatchRequest is the workflow_dispatch call gh made.
+type dispatchRequest struct {
+	Owner, Repo, Workflow string
+	Ref                   string
+	Inputs                map[string]string
+}
+
+// findDispatch reads the last workflow dispatch out of a GH_DEBUG=api log:
+// the "> POST .../actions/workflows/<id>/dispatches" request line, its
+// headers, a blank line, then the JSON body.
+func findDispatch(log string) (dispatchRequest, bool) {
+	lines := strings.Split(ansiColour.ReplaceAllString(log, ""), "\n")
+	var found dispatchRequest
+	ok := false
+	for i := 0; i < len(lines); i++ {
+		m := dispatchPath.FindStringSubmatch(strings.TrimRight(lines[i], "\r"))
+		if m == nil {
+			continue
+		}
+		// skip the headers (to the blank line), then take the body (to the next)
+		for i++; i < len(lines) && strings.TrimSpace(lines[i]) != ""; i++ {
+		}
+		var body []string
+		for i++; i < len(lines) && strings.TrimSpace(lines[i]) != ""; i++ {
+			body = append(body, lines[i])
+		}
+		var payload struct {
+			Ref    string                     `json:"ref"`
+			Inputs map[string]json.RawMessage `json:"inputs"`
+		}
+		if json.Unmarshal([]byte(strings.Join(body, "\n")), &payload) != nil || payload.Ref == "" {
+			continue
+		}
+		inputs := make(map[string]string, len(payload.Inputs))
+		for k, raw := range payload.Inputs {
+			var str string
+			if json.Unmarshal(raw, &str) == nil {
+				inputs[k] = str
+			} else {
+				inputs[k] = string(raw) // a number or boolean, as written
+			}
+		}
+		found = dispatchRequest{m[1], m[2], m[3], payload.Ref, inputs}
+		ok = true
+	}
+	return found, ok
+}
+
+// command is the gh invocation that makes the same dispatch.
+func (d dispatchRequest) command() string {
+	parts := []string{"gh", "workflow", "run", shellQuote(d.Workflow),
+		"-R", shellQuote(d.Owner + "/" + d.Repo), "--ref", shellQuote(d.Ref)}
+	keys := make([]string, 0, len(d.Inputs))
+	for k := range d.Inputs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		parts = append(parts, "-f", shellQuote(k+"="+d.Inputs[k]))
+	}
+	return strings.Join(parts, " ")
+}
+
+var shellSafe = regexp.MustCompile(`^[A-Za-z0-9_@%+=:,./-]+$`)
+
+// shellQuote quotes s for a POSIX shell, only when it needs it.
+func shellQuote(s string) string {
+	if shellSafe.MatchString(s) {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // githubNow is the current time by GitHub's clock (the Date header of an API
@@ -749,9 +1022,9 @@ func listRuns(ref string, user string, limit string) ([]workflowRun, error) {
 // options are gharun's own command line. Everything after "--" is kept
 // verbatim in passthrough for `gh workflow run`.
 type options struct {
-	help, version, install, upgrade bool
-	ref, repo                       string
-	passthrough                     []string
+	help, version, install, upgrade, capture bool
+	ref, repo                                string
+	passthrough                              []string
 }
 
 const helpText = `gharun - dispatch a GitHub workflow on a branch and watch it run
@@ -769,6 +1042,11 @@ Options:
   -r, --ref <branch>   run against this branch; skips the branch prompt
   -R, --repo <o/r>     use this repository (OWNER/REPO) instead of the current
                        one; skips the local uncommitted/unpushed checks
+      --capture        ask for a name, run as usual, and save how the workflow was
+                       dispatched (everything but the branch) as a recipe for this
+                       repository's origin remote. Later runs offer a menu of the
+                       recipes, plus "interactive" for the usual prompts. Recipes
+                       are plain-text files in ~/.config/gharun/<repo>/ to edit by hand.
       --version        print the version and exit
       --install        copy this binary to ~/.local/bin and exit; warns if that
                        folder is not in your PATH
@@ -828,6 +1106,8 @@ func parseArgs(args []string) (options, error) {
 			o.install = true
 		case a == "--upgrade":
 			o.upgrade = true
+		case a == "--capture":
+			o.capture = true
 		case matches(a, "-r", "--ref"):
 			v, ok := value(&i, a, "-r", "--ref")
 			if !ok || v == "" {
