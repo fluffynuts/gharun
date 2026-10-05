@@ -11,6 +11,7 @@
 // arguments before it show the help and exit 2 (see helpText).
 // --version prints the version, commit and build time.
 // --install copies this binary to ~/.local/bin (warning if that isn't on PATH).
+// Every run, dispatched or watched, ends with a system notification (best effort).
 // --watch <run url> just watches that run to completion.
 // --capture asks for a name, runs as usual and saves the dispatch (minus the
 // branch) as a recipe; next time, a menu offers the repository's recipes (see recipe.go).
@@ -195,6 +196,7 @@ func run(args []string) int {
 				return 1
 			}
 			chosenRecipe = r
+			recipeRepo = key
 		}
 	}
 	passthrough := opts.passthrough
@@ -234,12 +236,18 @@ func run(args []string) int {
 	}
 
 	fmt.Println(dim.Render(fmt.Sprintf("Dispatching against ref: %s", ref)))
+	if chosenRecipe != nil {
+		path, _ := recipePath(recipeRepo, chosenRecipe.Name)
+		fmt.Println(dim.Render(fmt.Sprintf("Running recipe: %s (%s)", chosenRecipe.Name, path)))
+	}
 	code, ghLog := dispatch(ref, passthrough)
 	if code != 0 {
 		return code
 	}
 	dispatched, understood := findDispatch(ghLog)
-	if understood {
+	if chosenRecipe != nil {
+		// the recipe says what was run; no need to work it out from gh's log
+	} else if understood {
 		dispatched.Workflow = workflowFile(dispatched)
 		fmt.Println(dim.Render("Equivalent command:"))
 		fmt.Println("  " + dispatched.command())
@@ -274,7 +282,7 @@ func run(args []string) int {
 		fail(err.Error())
 		return 1
 	}
-	if !understood {
+	if !understood && chosenRecipe == nil {
 		printBestGuess(ref, passthrough, newRun)
 	}
 	fmt.Printf("Watching %s: %s\n", newRun.WorkflowName, newRun.URL)
@@ -1032,6 +1040,7 @@ func watch(id int64) int {
 				continue
 			}
 			finish()
+			notifyCompletion(r)
 			if r.Conclusion == "success" {
 				fmt.Println(green.Render(r.URL))
 				fmt.Println(green.Render("SUCCESS"))
@@ -1064,6 +1073,21 @@ func clockElapsed(watchStarted, now time.Time, skew time.Duration, runStart, run
 		return d
 	}
 	return 0
+}
+
+// notifyCompletion tells the user, system-wide, that a run has finished.
+func notifyCompletion(r workflowRun) {
+	name := r.WorkflowName
+	if name == "" {
+		name = "workflow"
+	}
+	if r.Conclusion == "success" {
+		notify("gharun: "+name, "SUCCESS")
+	} else if r.Conclusion == "failure" {
+		notify("gharun: "+name, "FAILED")
+	} else {
+		notify("gharun: "+name, "FAILED ("+r.Conclusion+")")
+	}
 }
 
 // formatClock renders d as MM:SS, or H:MM:SS from an hour up.
