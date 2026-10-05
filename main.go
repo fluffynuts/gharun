@@ -15,7 +15,8 @@
 // --watch <run url> just watches that run to completion.
 // --capture asks for a name, runs as usual and saves the dispatch (minus the
 // branch) as a recipe; next time, a menu offers the repository's recipes (see recipe.go).
-// --upgrade downloads the latest release for this machine and installs it.
+// --upgrade downloads the latest release for this machine and installs it over
+// the gharun on PATH (or to ~/.local/bin if there isn't one).
 // If --ref/-r is supplied, the branch prompt is skipped.
 // Before dispatching, the checked-out branch must exist on the remote (else
 // exit 1), and uncommitted or unpushed work needs confirming.
@@ -348,23 +349,47 @@ func install() int {
 		fail(err.Error())
 		return 1
 	}
-	return installFrom(self)
-}
-
-// installFrom copies the binary at src into ~/.local/bin.
-func installFrom(src string) int {
-	home, err := os.UserHomeDir()
+	dest, err := defaultInstallPath()
 	if err != nil {
 		fail(err.Error())
 		return 1
 	}
-	dir := filepath.Join(home, ".local", "bin")
-	name := "gharun"
-	if runtime.GOOS == "windows" {
-		name += ".exe"
-	}
-	dest := filepath.Join(dir, name)
+	return installTo(self, dest)
+}
 
+func exeName() string {
+	if runtime.GOOS == "windows" {
+		return "gharun.exe"
+	}
+	return "gharun"
+}
+
+// defaultInstallPath is ~/.local/bin/gharun.
+func defaultInstallPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".local", "bin", exeName()), nil
+}
+
+// upgradeTarget is the gharun found on PATH (symlinks resolved, so the real
+// file is replaced rather than the link), or the default install path when
+// there isn't one.
+func upgradeTarget() (string, error) {
+	if found, err := exec.LookPath(exeName()); err == nil {
+		if abs, err := filepath.Abs(found); err == nil {
+			if real, err := filepath.EvalSymlinks(abs); err == nil {
+				return real, nil
+			}
+		}
+	}
+	return defaultInstallPath()
+}
+
+// installTo copies the binary at src to dest and warns if dest's folder isn't
+// on PATH.
+func installTo(src, dest string) int {
 	if same, _ := sameFile(src, dest); same {
 		fmt.Println(dim.Render(dest + " is this binary already; nothing to copy"))
 	} else {
@@ -375,7 +400,7 @@ func installFrom(src string) int {
 		fmt.Println(green.Render("Installed " + dest))
 	}
 
-	if !dirOnPath(dir) {
+	if dir := filepath.Dir(dest); !dirOnPath(dir) {
 		fmt.Fprintln(os.Stderr, yellow.Render(fmt.Sprintf(
 			"Warning: %s is not in your PATH; add it (e.g. export PATH=\"$HOME/.local/bin:$PATH\") to run gharun by name", dir)))
 	}
@@ -383,8 +408,14 @@ func installFrom(src string) int {
 }
 
 // upgrade downloads the latest release's zip for this OS/arch, checks it
-// against the release's SHA256SUMS, and installs the binary inside it.
+// against the release's SHA256SUMS, and installs the binary inside it over the
+// gharun on PATH (or to ~/.local/bin if there isn't one).
 func upgrade() int {
+	dest, err := upgradeTarget()
+	if err != nil {
+		fail(err.Error())
+		return 1
+	}
 	osName := runtime.GOOS
 	if osName == "darwin" {
 		osName = "macos"
@@ -411,10 +442,7 @@ func upgrade() int {
 		return 1
 	}
 
-	exe := "gharun"
-	if runtime.GOOS == "windows" {
-		exe += ".exe"
-	}
+	exe := exeName()
 	dir, err := os.MkdirTemp("", "gharun-upgrade-*")
 	if err != nil {
 		fail(err.Error())
@@ -426,7 +454,7 @@ func upgrade() int {
 		fail(err.Error())
 		return 1
 	}
-	return installFrom(extracted)
+	return installTo(extracted, dest)
 }
 
 func httpGet(url string) ([]byte, error) {
@@ -1162,7 +1190,8 @@ Options:
       --install        copy this binary to ~/.local/bin and exit; warns if that
                        folder is not in your PATH
       --upgrade        download the latest release for this machine, install it
-                       to ~/.local/bin and exit
+                       over the gharun found in your PATH (or to ~/.local/bin if
+                       there isn't one) and exit
   -h, --help           show this help and exit
 
 Passing arguments to gh workflow run:

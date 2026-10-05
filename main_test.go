@@ -48,6 +48,7 @@ func TestUpgradeInstallsLatestRelease(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
+	t.Setenv("PATH", "") // no gharun on PATH: upgrade installs to ~/.local/bin
 
 	bad := serve(fmt.Sprintf("%064x  %s\n", 0, asset))
 	defer bad.Close()
@@ -65,6 +66,40 @@ func TestUpgradeInstallsLatestRelease(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(home, ".local", "bin", exe))
 	if err != nil || string(got) != "new binary" {
 		t.Fatalf("installed binary = %q, %v", got, err)
+	}
+}
+
+func TestUpgradeTargetIsTheGharunOnPath(t *testing.T) {
+	exe := "gharun"
+	if runtime.GOOS == "windows" {
+		exe += ".exe"
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	t.Setenv("PATH", t.TempDir())
+	got, err := upgradeTarget()
+	if want := filepath.Join(home, ".local", "bin", exe); err != nil || got != want {
+		t.Fatalf("with no gharun on PATH, upgradeTarget = %q, %v; want %q", got, err, want)
+	}
+
+	real := filepath.Join(t.TempDir(), exe)
+	if err := os.WriteFile(real, []byte("old binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pathed := t.TempDir()
+	t.Setenv("PATH", pathed)
+	if runtime.GOOS == "windows" {
+		pathed = filepath.Dir(real) // symlinks need privileges on Windows
+		t.Setenv("PATH", pathed)
+	} else if err := os.Symlink(real, filepath.Join(pathed, exe)); err != nil {
+		t.Fatal(err)
+	}
+	got, err = upgradeTarget()
+	wantReal, _ := filepath.EvalSymlinks(real)
+	if err != nil || got != wantReal {
+		t.Fatalf("upgradeTarget = %q, %v; want %q (the symlink's target)", got, err, wantReal)
 	}
 }
 
