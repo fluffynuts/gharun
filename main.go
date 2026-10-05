@@ -11,6 +11,7 @@
 // arguments before it show the help and exit 2 (see helpText).
 // --version prints the version, commit and build time.
 // --install copies this binary to ~/.local/bin (warning if that isn't on PATH).
+// --watch <run url> just watches that run to completion.
 // --capture asks for a name, runs as usual and saves the dispatch (minus the
 // branch) as a recipe; next time, a menu offers the repository's recipes (see recipe.go).
 // --upgrade downloads the latest release for this machine and installs it.
@@ -30,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -39,6 +41,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -109,6 +112,8 @@ type workflowRun struct {
 	URL          string    `json:"url"`
 	WorkflowName string    `json:"workflowName"`
 	CreatedAt    time.Time `json:"createdAt"`
+	StartedAt    time.Time `json:"startedAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
 }
 
 func main() {
@@ -133,6 +138,8 @@ func run(args []string) int {
 		return install()
 	case opts.upgrade:
 		return upgrade()
+	case opts.watchURL != "":
+		return watchURLRun(opts.watchURL)
 	}
 
 	if _, err := exec.LookPath("gh"); err != nil {
@@ -274,6 +281,55 @@ func run(args []string) int {
 	fmt.Println(dim.Render("(Ctrl-C stops watching; the run itself keeps going)"))
 
 	return watch(newRun.DatabaseID)
+}
+
+// parseRunURL splits a workflow run URL such as
+// https://github.com/owner/repo/actions/runs/123 (optionally followed by
+// /job/456, /attempts/2 or a query) into its host, "owner/repo" and run id.
+func parseRunURL(raw string) (host, repo string, id int64, err error) {
+	u, perr := url.Parse(strings.TrimSpace(raw))
+	if perr != nil || u.Host == "" {
+		return "", "", 0, fmt.Errorf("%q is not a URL", raw)
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) < 5 || parts[2] != "actions" || parts[3] != "runs" {
+		return "", "", 0, fmt.Errorf("%q is not a workflow run URL (expected https://%s/<owner>/<repo>/actions/runs/<id>)", raw, u.Host)
+	}
+	if id, err = strconv.ParseInt(parts[4], 10, 64); err != nil || id <= 0 {
+		return "", "", 0, fmt.Errorf("%q has no valid run id", raw)
+	}
+	return u.Host, parts[0] + "/" + parts[1], id, nil
+}
+
+// watchURLRun watches an existing run to completion.
+func watchURLRun(raw string) int {
+	host, repo, id, err := parseRunURL(raw)
+	if err != nil {
+		fail(err.Error())
+		return 1
+	}
+	if _, err := exec.LookPath("gh"); err != nil {
+		fail("gh CLI not found on PATH")
+		return 1
+	}
+	if host != "github.com" {
+		repo = host + "/" + repo
+	}
+	os.Setenv("GH_REPO", repo)
+
+	out, err := ghOutput("run", "view", fmt.Sprint(id), "--json", "workflowName,url")
+	if err != nil {
+		fail(err.Error())
+		return 1
+	}
+	var run workflowRun
+	if err := json.Unmarshal([]byte(out), &run); err != nil {
+		fail(fmt.Sprintf("parsing run: %v", err))
+		return 1
+	}
+	fmt.Printf("Watching %s: %s\n", run.WorkflowName, run.URL)
+	fmt.Println(dim.Render("(Ctrl-C stops watching; the run itself keeps going)"))
+	return watch(id)
 }
 
 // install copies the running binary into ~/.local/bin and warns if that
@@ -897,8 +953,12 @@ func watch(id int64) int {
 	status := "waiting"
 	note := ""
 	lastPrinted := ""
+	// Once the run is going, the clock shows how long the workflow has run
+	// (by GitHub's timestamps, corrected for our clock's skew from GitHub's).
+	skew := githubNow().Sub(time.Now())
+	var runStart, runEnd time.Time
 	render := func() {
-		line := fmt.Sprintf("[%s] %s%s", formatClock(time.Since(started)), status, note)
+		line := fmt.Sprintf("[%s] %s%s", formatClock(clockElapsed(started, time.Now(), skew, runStart, runEnd)), status, note)
 		if live {
 			fmt.Print("\r\x1b[2K" + dim.Render(line))
 		} else if status != lastPrinted {
@@ -919,7 +979,7 @@ func watch(id int64) int {
 	poll := func() {
 		polling = true
 		go func() {
-			out, err := ghOutput("run", "view", idStr, "--json", "status,conclusion,url,workflowName")
+			out, err := ghOutput("run", "view", idStr, "--json", "status,conclusion,url,workflowName,startedAt,updatedAt")
 			var r workflowRun
 			if err == nil {
 				if jerr := json.Unmarshal([]byte(out), &r); jerr != nil {
@@ -960,6 +1020,12 @@ func watch(id int64) int {
 			note = ""
 			r := res.run
 			status = r.Status
+			if (r.Status == "in_progress" || r.Status == "completed") && !r.StartedAt.IsZero() {
+				runStart = r.StartedAt
+			}
+			if r.Status == "completed" {
+				runEnd = r.UpdatedAt
+			}
 			render()
 
 			if r.Status != "completed" {
@@ -980,6 +1046,24 @@ func watch(id int64) int {
 			return 1
 		}
 	}
+}
+
+// clockElapsed is what the status line's clock shows: the time since watching
+// began until the run has started; then the workflow's own run time (from its
+// start to now, or to its end once it has finished). skew is how far GitHub's
+// clock is ahead of ours.
+func clockElapsed(watchStarted, now time.Time, skew time.Duration, runStart, runEnd time.Time) time.Duration {
+	if runStart.IsZero() {
+		return now.Sub(watchStarted)
+	}
+	end := now.Add(skew)
+	if !runEnd.IsZero() {
+		end = runEnd
+	}
+	if d := end.Sub(runStart); d > 0 {
+		return d
+	}
+	return 0
 }
 
 // formatClock renders d as MM:SS, or H:MM:SS from an hour up.
@@ -1023,7 +1107,7 @@ func listRuns(ref string, user string, limit string) ([]workflowRun, error) {
 // verbatim in passthrough for `gh workflow run`.
 type options struct {
 	help, version, install, upgrade, capture bool
-	ref, repo                                string
+	ref, repo, watchURL                      string
 	passthrough                              []string
 }
 
@@ -1047,6 +1131,9 @@ Options:
                        repository's origin remote. Later runs offer a menu of the
                        recipes, plus "interactive" for the usual prompts. Recipes
                        are plain-text files in ~/.config/gharun/<repo>/ to edit by hand.
+      --watch <url>    don't dispatch anything: watch the workflow run at this URL
+                       (https://github.com/<owner>/<repo>/actions/runs/<id>) until
+                       it completes, then report SUCCESS or FAILED (exit 0 or 1)
       --version        print the version and exit
       --install        copy this binary to ~/.local/bin and exit; warns if that
                        folder is not in your PATH
@@ -1108,6 +1195,19 @@ func parseArgs(args []string) (options, error) {
 			o.upgrade = true
 		case a == "--capture":
 			o.capture = true
+		case a == "--watch" || strings.HasPrefix(a, "--watch="):
+			v := strings.TrimPrefix(a, "--watch=")
+			if a == "--watch" {
+				if i+1 >= len(args) {
+					return o, errors.New("--watch needs the URL of a workflow run")
+				}
+				i++
+				v = args[i]
+			}
+			if v == "" {
+				return o, errors.New("--watch needs the URL of a workflow run")
+			}
+			o.watchURL = v
 		case matches(a, "-r", "--ref"):
 			v, ok := value(&i, a, "-r", "--ref")
 			if !ok || v == "" {

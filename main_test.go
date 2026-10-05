@@ -201,3 +201,45 @@ func TestRecipeRoundTrip(t *testing.T) {
 		t.Error("parseRecipe accepted an unknown option")
 	}
 }
+
+func TestParseRunURL(t *testing.T) {
+	for _, u := range []string{
+		"https://github.com/o/r/actions/runs/123",
+		"https://github.com/o/r/actions/runs/123/job/456?pr=7",
+		"https://github.com/o/r/actions/runs/123/attempts/2",
+	} {
+		host, repo, id, err := parseRunURL(u)
+		if err != nil || host != "github.com" || repo != "o/r" || id != 123 {
+			t.Errorf("parseRunURL(%q) = %s, %s, %d, %v", u, host, repo, id, err)
+		}
+	}
+	for _, u := range []string{"123", "https://github.com/o/r", "https://github.com/o/r/actions/workflows/build.yml", "https://github.com/o/r/actions/runs/abc"} {
+		if _, _, _, err := parseRunURL(u); err == nil {
+			t.Errorf("parseRunURL(%q) accepted", u)
+		}
+	}
+	if o, err := parseArgs([]string{"--watch=https://x/o/r/actions/runs/1"}); err != nil || o.watchURL == "" {
+		t.Errorf("--watch= not parsed: %+v, %v", o, err)
+	}
+	if _, err := parseArgs([]string{"--watch"}); err == nil {
+		t.Error("--watch without a URL accepted")
+	}
+}
+
+func TestClockElapsed(t *testing.T) {
+	t0 := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	now := t0.Add(30 * time.Second)
+	// not started: our own clock
+	if got := clockElapsed(t0, now, 0, time.Time{}, time.Time{}); got != 30*time.Second {
+		t.Errorf("before start = %v", got)
+	}
+	// started on GitHub's clock 5 minutes ago, our clock 2 seconds behind it
+	runStart := now.Add(2*time.Second - 5*time.Minute)
+	if got := clockElapsed(t0, now, 2*time.Second, runStart, time.Time{}); got != 5*time.Minute {
+		t.Errorf("running = %v", got)
+	}
+	// finished: the run's own duration, whatever the time now
+	if got := clockElapsed(t0, now.Add(time.Hour), 0, runStart, runStart.Add(90*time.Second)); got != 90*time.Second {
+		t.Errorf("finished = %v", got)
+	}
+}
