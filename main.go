@@ -16,6 +16,8 @@
 // --watch <run url> just watches that run to completion.
 // --capture asks for a name, runs as usual and saves the dispatch (minus the
 // branch) as a recipe; next time, a menu offers the repository's recipes (see recipe.go).
+// --recipe lists the repository's recipes; --recipe <name> runs that one
+// (matched case-insensitively) without the menu, or lists them if it isn't found.
 // --upgrade downloads the latest release for this machine and installs it over
 // the gharun on PATH (or to ~/.local/bin if there isn't one).
 // If --ref/-r is supplied, the branch prompt is skipped.
@@ -145,6 +147,47 @@ func run(args []string) int {
 		return watchURLRun(opts.watchURL)
 	}
 
+	// --recipe lists or picks a recipe up front, so a typo fails before any prompts.
+	var recipeRepo string
+	var chosenRecipe *recipe
+	if opts.recipe {
+		key, err := recipeRepoKey(opts.repo)
+		if err != nil {
+			fail(err.Error())
+			return 1
+		}
+		names := listRecipes(key)
+		if opts.recipeName == "" {
+			if len(names) == 0 {
+				fmt.Fprintln(os.Stderr, "No recipes for "+key+" (make one with --capture)")
+			}
+			for _, n := range names {
+				fmt.Println(n)
+			}
+			return 0
+		}
+		name, ok := findRecipe(names, opts.recipeName)
+		if !ok {
+			fail("recipe not found: " + opts.recipeName)
+			if len(names) == 0 {
+				fmt.Fprintln(os.Stderr, "There are no recipes for "+key+" (make one with --capture)")
+			} else {
+				fmt.Fprintln(os.Stderr, "Available recipes:")
+				for _, n := range names {
+					fmt.Fprintln(os.Stderr, "  "+n)
+				}
+			}
+			return 1
+		}
+		r, err := loadRecipe(key, name)
+		if err != nil {
+			fail(err.Error())
+			return 1
+		}
+		chosenRecipe = &r
+		recipeRepo = key
+	}
+
 	if _, err := exec.LookPath("gh"); err != nil {
 		fail("gh CLI not found on PATH")
 		return 1
@@ -164,10 +207,11 @@ func run(args []string) int {
 			return code
 		}
 	}
-	// Recipes belong to this checkout's origin remote.
-	var recipeRepo, captureName string
-	var chosenRecipe *recipe
+	// Recipes belong to this checkout's origin remote (or the --repo one).
+	var captureName string
 	switch {
+	case chosenRecipe != nil:
+		// chosen with --recipe
 	case opts.capture && hasRepo:
 		fail("--capture needs a local checkout; it can't be combined with --repo")
 		return 1
@@ -1181,9 +1225,9 @@ func listRuns(ref string, user string, limit string) ([]workflowRun, error) {
 // options are gharun's own command line. Everything after "--" is kept
 // verbatim in passthrough for `gh workflow run`.
 type options struct {
-	help, version, install, upgrade, capture bool
-	ref, repo, watchURL                      string
-	passthrough                              []string
+	help, version, install, upgrade, capture, recipe bool
+	ref, repo, watchURL, recipeName                  string
+	passthrough                                      []string
 }
 
 const helpText = `gharun - dispatch a GitHub workflow on a branch and watch it run
@@ -1206,6 +1250,9 @@ Options:
                        repository's origin remote. Later runs offer a menu of the
                        recipes, plus "interactive" for the usual prompts. Recipes
                        are plain-text files in ~/.config/gharun/<repo>/ to edit by hand.
+      --recipe [name]  run the named recipe (case-insensitive) without the menu;
+                       with no name, list this repository's recipes and exit.
+                       With --repo, uses that repository's recipes
       --watch <url>    don't dispatch anything: watch the workflow run at this URL
                        (https://github.com/<owner>/<repo>/actions/runs/<id>) until
                        it completes, then report SUCCESS or FAILED (exit 0 or 1)
@@ -1261,6 +1308,9 @@ func parseArgs(args []string) (options, error) {
 		switch {
 		case a == "--":
 			o.passthrough = args[i+1:]
+			if o.recipe && len(o.passthrough) > 0 {
+				return o, errors.New("--recipe can't be combined with gh workflow run arguments")
+			}
 			return o, nil
 		case a == "-h" || a == "--help":
 			o.help = true
@@ -1272,6 +1322,19 @@ func parseArgs(args []string) (options, error) {
 			o.upgrade = true
 		case a == "--capture":
 			o.capture = true
+		case a == "--recipe":
+			// the next argument is the name, unless it is another option
+			o.recipe = true
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+				o.recipeName = args[i]
+			}
+		case strings.HasPrefix(a, "--recipe="):
+			o.recipe = true
+			o.recipeName = strings.TrimPrefix(a, "--recipe=")
+			if o.recipeName == "" {
+				return o, errors.New("--recipe= needs a recipe name")
+			}
 		case a == "--watch" || strings.HasPrefix(a, "--watch="):
 			v := strings.TrimPrefix(a, "--watch=")
 			if a == "--watch" {
@@ -1300,6 +1363,9 @@ func parseArgs(args []string) (options, error) {
 		default:
 			return o, fmt.Errorf("unknown argument %q", a)
 		}
+	}
+	if o.recipe && o.capture {
+		return o, errors.New("--recipe and --capture can't be combined")
 	}
 	return o, nil
 }

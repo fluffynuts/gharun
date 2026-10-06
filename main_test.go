@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -150,6 +152,105 @@ func TestParseArgs(t *testing.T) {
 			t.Errorf("parseArgs(%v) accepted bad arguments", bad)
 		}
 	}
+}
+
+func TestParseRecipeArgs(t *testing.T) {
+	for _, c := range []struct {
+		args []string
+		name string
+		ref  string
+	}{
+		{[]string{"--recipe"}, "", ""},
+		{[]string{"--recipe", "-r", "main"}, "", "main"},
+		{[]string{"--recipe", "deploy to staging", "-r", "main"}, "deploy to staging", "main"},
+		{[]string{"--recipe=Deploy"}, "Deploy", ""},
+	} {
+		o, err := parseArgs(c.args)
+		if err != nil || !o.recipe || o.recipeName != c.name || o.ref != c.ref {
+			t.Errorf("parseArgs(%q) = %+v, %v", c.args, o, err)
+		}
+	}
+	for _, bad := range [][]string{{"--recipe="}, {"--recipe", "x", "--capture"}, {"--recipe", "x", "--", "a.yml"}} {
+		if _, err := parseArgs(bad); err == nil {
+			t.Errorf("parseArgs(%q) accepted bad arguments", bad)
+		}
+	}
+}
+
+func TestFindRecipe(t *testing.T) {
+	names := []string{"Deploy", "deploy", "nightly build"}
+	for want, got := range map[string]string{"DEPLOY": "Deploy", "deploy": "deploy", "Nightly Build": "nightly build"} {
+		if n, ok := findRecipe(names, want); !ok || n != got {
+			t.Errorf("findRecipe(%q) = %q, %v; want %q", want, n, ok, got)
+		}
+	}
+	if _, ok := findRecipe(names, "nightly"); ok {
+		t.Error("findRecipe matched part of a name")
+	}
+}
+
+func TestRecipeRepoKey(t *testing.T) {
+	t.Setenv("GH_HOST", "")
+	for repo, want := range map[string]string{
+		"Fluffynuts/gharun":                    "github.com/fluffynuts/gharun",
+		"github.example/acme/app":              "github.example/acme/app",
+		"https://github.com/fluffynuts/gharun": "github.com/fluffynuts/gharun",
+	} {
+		if got, err := recipeRepoKey(repo); err != nil || got != want {
+			t.Errorf("recipeRepoKey(%q) = %q, %v; want %q", repo, got, err, want)
+		}
+	}
+	t.Setenv("GH_HOST", "github.example")
+	if got, _ := recipeRepoKey("acme/app"); got != "github.example/acme/app" {
+		t.Errorf("with GH_HOST, recipeRepoKey = %q", got)
+	}
+}
+
+func TestRecipeNotFoundListsRecipes(t *testing.T) {
+	config := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", config)
+	t.Setenv("GH_HOST", "")
+	for _, n := range []string{"deploy", "nightly"} {
+		if _, err := saveRecipe(recipe{Name: n, Repo: "github.com/o/r", Workflow: "a.yml"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stdout, stderr, code := captureRun(t, "-R", "o/r", "--recipe", "bogus")
+	if code != 1 || stdout != "" ||
+		!strings.Contains(stderr, "recipe not found: bogus") ||
+		!strings.Contains(stderr, "Available recipes:\n  deploy\n  nightly\n") {
+		t.Fatalf("code %d\nstdout: %q\nstderr: %q", code, stdout, stderr)
+	}
+	stdout, _, code = captureRun(t, "-R", "o/r", "--recipe")
+	if code != 0 || stdout != "deploy\nnightly\n" {
+		t.Fatalf("listing: code %d, stdout %q", code, stdout)
+	}
+}
+
+// captureRun calls run with args and returns what it printed and its exit code.
+func captureRun(t *testing.T, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+	read := func(f **os.File) func() string {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		orig := *f
+		*f = w
+		done := make(chan string)
+		go func() {
+			b, _ := io.ReadAll(r)
+			done <- string(b)
+		}()
+		return func() string {
+			w.Close()
+			*f = orig
+			return <-done
+		}
+	}
+	outDone, errDone := read(&os.Stdout), read(&os.Stderr)
+	code = run(args)
+	return outDone(), errDone(), code
 }
 
 func TestFindDispatchAndCommand(t *testing.T) {

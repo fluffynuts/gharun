@@ -80,6 +80,38 @@ func originKey() (string, error) {
 	return normalizeRepoURL(out), nil
 }
 
+// recipeRepoKey is the recipe key for --repo (OWNER/REPO, HOST/OWNER/REPO or
+// a URL, as gh accepts), or for this checkout's origin when repo is empty.
+func recipeRepoKey(repo string) (string, error) {
+	switch {
+	case repo == "":
+		return originKey()
+	case strings.Count(repo, "/") == 1 && !strings.ContainsAny(repo, ":@"):
+		host := os.Getenv("GH_HOST")
+		if host == "" {
+			host = "github.com"
+		}
+		return normalizeRepoURL(host + "/" + repo), nil
+	}
+	return normalizeRepoURL(repo), nil
+}
+
+// findRecipe is the name in names matching want, ignoring case (an exact
+// match wins if two names differ only by case).
+func findRecipe(names []string, want string) (string, bool) {
+	for _, n := range names {
+		if n == want {
+			return n, true
+		}
+	}
+	for _, n := range names {
+		if strings.EqualFold(n, want) {
+			return n, true
+		}
+	}
+	return "", false
+}
+
 func recipeDir(repoKey string) (string, error) {
 	config := os.Getenv("XDG_CONFIG_HOME")
 	if config == "" {
