@@ -734,8 +734,9 @@ func promptForBranch() (string, error) {
 	selected := ordered[0]
 	sel := huh.NewSelect[string]().
 		Title("Branch to run against").
-		Description("↑/↓ to move, / to filter, enter to select").
-		Options(huh.NewOptions(ordered...)...).
+		Description("↑/↓ to move, type to filter, enter to select").
+		Filtering(true).
+		Options(branchOptions(ordered, current)...).
 		Value(&selected)
 	if len(ordered) > 12 {
 		sel = sel.Height(15)
@@ -744,6 +745,20 @@ func promptForBranch() (string, error) {
 		return "", err
 	}
 	return selected, nil
+}
+
+// branchOptions marks the current branch with a leading asterisk, as git does,
+// while the option value stays the bare branch name.
+func branchOptions(branches []string, current string) []huh.Option[string] {
+	options := make([]huh.Option[string], 0, len(branches))
+	for _, b := range branches {
+		label := "  " + b
+		if b == current {
+			label = "* " + b
+		}
+		options = append(options, huh.NewOption(label, b))
+	}
+	return options
 }
 
 // dispatch runs `gh workflow run` attached to the real terminal. gh refuses
