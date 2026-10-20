@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charmbracelet/huh"
 )
 
 func TestUpgradeInstallsLatestRelease(t *testing.T) {
@@ -160,8 +163,6 @@ func TestParseRecipeArgs(t *testing.T) {
 		name string
 		ref  string
 	}{
-		{[]string{"--recipe"}, "", ""},
-		{[]string{"--recipe", "-r", "main"}, "", "main"},
 		{[]string{"--recipe", "deploy to staging", "-r", "main"}, "deploy to staging", "main"},
 		{[]string{"--recipe=Deploy"}, "Deploy", ""},
 	} {
@@ -170,7 +171,7 @@ func TestParseRecipeArgs(t *testing.T) {
 			t.Errorf("parseArgs(%q) = %+v, %v", c.args, o, err)
 		}
 	}
-	for _, bad := range [][]string{{"--recipe="}, {"--recipe", "x", "--capture"}, {"--recipe", "x", "--", "a.yml"}} {
+	for _, bad := range [][]string{{"--recipe="}, {"--recipe"}, {"--recipe", "-r", "main"}, {"--recipe", "x", "--", "a.yml"}} {
 		if _, err := parseArgs(bad); err == nil {
 			t.Errorf("parseArgs(%q) accepted bad arguments", bad)
 		}
@@ -221,14 +222,20 @@ func TestRecipeNotFoundListsRecipes(t *testing.T) {
 		!strings.Contains(stderr, "Available recipes:\n  deploy\n  nightly\n") {
 		t.Fatalf("code %d\nstdout: %q\nstderr: %q", code, stdout, stderr)
 	}
-	stdout, _, code = captureRun(t, "-R", "o/r", "--recipe")
-	if code != 0 || stdout != "deploy\nnightly\n" {
-		t.Fatalf("listing: code %d, stdout %q", code, stdout)
+	stdout, stderr, code = captureRun(t, "-R", "o/r", "--recipe")
+	if code != 2 || stdout != "" || !strings.Contains(stderr, "needs the name of a recipe") || !strings.Contains(stderr, "--recipes") {
+		t.Fatalf("bare --recipe: code %d\nstdout: %q\nstderr: %q", code, stdout, stderr)
 	}
 }
 
 // captureRun calls run with args and returns what it printed and its exit code.
 func captureRun(t *testing.T, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+	return captureOutput(t, func() int { return run(args) })
+}
+
+// captureOutput calls f and returns what it printed and the code f returned.
+func captureOutput(t *testing.T, f func() int) (stdout, stderr string, code int) {
 	t.Helper()
 	read := func(f **os.File) func() string {
 		r, w, err := os.Pipe()
@@ -249,7 +256,7 @@ func captureRun(t *testing.T, args ...string) (stdout, stderr string, code int) 
 		}
 	}
 	outDone, errDone := read(&os.Stdout), read(&os.Stderr)
-	code = run(args)
+	code = f()
 	return outDone(), errDone(), code
 }
 
@@ -377,5 +384,323 @@ func TestClockElapsed(t *testing.T) {
 	// finished: the run's own duration, whatever the time now
 	if got := clockElapsed(t0, now.Add(time.Hour), 0, runStart, runStart.Add(90*time.Second)); got != 90*time.Second {
 		t.Errorf("finished = %v", got)
+	}
+}
+
+func TestParseSaveLastArgs(t *testing.T) {
+	if o, err := parseArgs([]string{"--save-last"}); err != nil || !o.saveLast {
+		t.Errorf("parseArgs(--save-last) = %+v, %v", o, err)
+	}
+	for _, bad := range [][]string{
+		{"--save-last", "--recipe", "x"},
+		{"--save-last", "-r", "main"},
+		{"--save-last", "-R", "o/r"},
+		{"--save-last", "--watch", "https://github.com/o/r/actions/runs/1"},
+		{"--save-last", "--", "a.yml"},
+		{"-r", "main", "--save-last", "--", "a.yml"},
+	} {
+		if _, err := parseArgs(bad); err == nil {
+			t.Errorf("parseArgs(%q) accepted bad arguments", bad)
+		}
+	}
+	if _, err := parseArgs([]string{"--capture"}); err == nil {
+		t.Error("--capture was removed but is still accepted")
+	}
+}
+
+func TestLastRunRoundTrip(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	key := "github.com/o/r"
+	if _, found, err := loadLastRun(key); found || err != nil {
+		t.Fatalf("fresh state: found %v, err %v", found, err)
+	}
+	last := recipe{Repo: key, Workflow: "build.yml", Inputs: map[string]string{"env": "staging", "note": "a\nb"}}
+	if err := rememberLastRun(last); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := loadLastRun(key)
+	if err != nil || !found || got.Workflow != "build.yml" || got.Inputs["env"] != "staging" || got.Inputs["note"] != "a\nb" {
+		t.Fatalf("loadLastRun = %+v, %v, %v", got, found, err)
+	}
+	if _, found, _ := loadLastRun("github.com/o/other"); found {
+		t.Error("last run leaked between repositories")
+	}
+	if names := listRecipes(key); len(names) != 0 {
+		t.Errorf("last run showed up as a recipe: %v", names)
+	}
+	if err := forgetLastRun(key); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _ := loadLastRun(key); found {
+		t.Error("last run still there after forgetLastRun")
+	}
+	if err := forgetLastRun(key); err != nil {
+		t.Errorf("forgetting nothing failed: %v", err)
+	}
+}
+
+func TestLastRunIsOwnerOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no unix permissions")
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	if err := rememberLastRun(recipe{Repo: "github.com/o/r", Workflow: "a.yml"}); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := lastRunPath("github.com/o/r")
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("state file mode: %v, %v", info, err)
+	}
+}
+
+func TestRecordLastRunSkipsWhatIsAlreadyARecipe(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	key := "github.com/o/r"
+	inputs := map[string]string{"env": "staging"}
+	if _, err := saveRecipe(recipe{Name: "staging", Repo: key, Workflow: "a.yml", Inputs: inputs}); err != nil {
+		t.Fatal(err)
+	}
+	// an older, different last run must not linger once a newer run is already a recipe
+	if err := rememberLastRun(recipe{Repo: key, Workflow: "old.yml"}); err != nil {
+		t.Fatal(err)
+	}
+
+	recordLastRun(recipe{Repo: key, Workflow: "a.yml", Inputs: map[string]string{"env": "staging"}})
+	if _, found, _ := loadLastRun(key); found {
+		t.Error("recorded a run identical to an existing recipe")
+	}
+
+	recordLastRun(recipe{Repo: key, Workflow: "a.yml", Inputs: map[string]string{"env": "prod"}})
+	got, found, _ := loadLastRun(key)
+	if !found || got.Inputs["env"] != "prod" {
+		t.Errorf("did not record a new run: %+v, %v", got, found)
+	}
+}
+
+func TestSaveLastTurnsLastRunIntoRecipe(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	key := "github.com/o/r"
+	name := func(string) (string, error) { return "staging", nil }
+
+	_, stderr, code := captureOutput(t, func() int { return saveLastAsRecipe(key, name) })
+	if code != 1 || !strings.Contains(stderr, "nothing to save") {
+		t.Fatalf("with no last run: code %d, stderr %q", code, stderr)
+	}
+
+	if err := rememberLastRun(recipe{Repo: key, Workflow: "build.yml", Inputs: map[string]string{"env": "staging"}}); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, code := captureOutput(t, func() int { return saveLastAsRecipe(key, name) })
+	if code != 0 || !strings.Contains(stdout, "build.yml") || !strings.Contains(stdout, "env=staging") {
+		t.Fatalf("saving: code %d, stdout %q", code, stdout)
+	}
+	r, err := loadRecipe(key, "staging")
+	if err != nil || r.Workflow != "build.yml" || r.Inputs["env"] != "staging" {
+		t.Fatalf("saved recipe = %+v, %v", r, err)
+	}
+
+	_, stderr, code = captureOutput(t, func() int { return saveLastAsRecipe(key, name) })
+	if code != 1 || !strings.Contains(stderr, "nothing to save") {
+		t.Fatalf("second save: code %d, stderr %q", code, stderr)
+	}
+}
+
+func TestSaveLastKeepsLastRunWhenAborted(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	key := "github.com/o/r"
+	if err := rememberLastRun(recipe{Repo: key, Workflow: "build.yml"}); err != nil {
+		t.Fatal(err)
+	}
+	abort := func(string) (string, error) { return "", huh.ErrUserAborted }
+	if _, _, code := captureOutput(t, func() int { return saveLastAsRecipe(key, abort) }); code != 130 {
+		t.Fatalf("aborting gave code %d, want 130", code)
+	}
+	if _, found, _ := loadLastRun(key); !found {
+		t.Error("last run was purged although no recipe was saved")
+	}
+}
+
+func TestRecipesListsRecipesForTheRepository(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("GH_HOST", "")
+
+	stdout, stderr, code := captureRun(t, "-R", "o/r", "--recipes")
+	if code != 0 || stdout != "" || !strings.Contains(stderr, "No recipes saved yet") {
+		t.Fatalf("no recipes: code %d\nstdout: %q\nstderr: %q", code, stdout, stderr)
+	}
+
+	for _, n := range []string{"nightly", "deploy"} {
+		if _, err := saveRecipe(recipe{Name: n, Repo: "github.com/o/r", Workflow: "a.yml"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stdout, stderr, code = captureRun(t, "-R", "o/r", "--recipes")
+	if code != 0 || stdout != "deploy\nnightly\n" || stderr != "" {
+		t.Fatalf("listing: code %d\nstdout: %q\nstderr: %q", code, stdout, stderr)
+	}
+}
+
+func TestParseRecipesArgs(t *testing.T) {
+	if o, err := parseArgs([]string{"--recipes", "-R", "o/r"}); err != nil || !o.recipes || o.repo != "o/r" {
+		t.Errorf("parseArgs(--recipes -R o/r) = %+v, %v", o, err)
+	}
+	for _, bad := range [][]string{
+		{"--recipes", "--recipe", "x"},
+		{"--recipes", "--save-last"},
+		{"--recipes", "-r", "main"},
+		{"--recipes", "--", "a.yml"},
+	} {
+		if _, err := parseArgs(bad); err == nil {
+			t.Errorf("parseArgs(%q) accepted bad arguments", bad)
+		}
+	}
+}
+
+func TestManageRecipesDeletesOnlyWhatWasSelectedAndConfirmed(t *testing.T) {
+	setup := func() string {
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		key := "github.com/o/r"
+		for _, n := range []string{"a", "b", "c"} {
+			if _, err := saveRecipe(recipe{Name: n, Repo: key, Workflow: "w.yml"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return key
+	}
+	choose := func(names ...string) func([]string) ([]string, error) {
+		return func(all []string) ([]string, error) {
+			if fmt.Sprint(all) != "[a b c]" {
+				t.Errorf("offered %v", all)
+			}
+			return names, nil
+		}
+	}
+	confirm := func(answer bool, asked *[]string) func([]string) (bool, error) {
+		return func(names []string) (bool, error) {
+			*asked = names
+			return answer, nil
+		}
+	}
+	remaining := func(key string) string { return fmt.Sprint(listRecipes(key)) }
+
+	key := setup()
+	var asked []string
+	if _, _, code := captureOutput(t, func() int { return manageRecipes(key, choose("a", "c"), confirm(true, &asked)) }); code != 0 {
+		t.Fatalf("code %d", code)
+	}
+	if fmt.Sprint(asked) != "[a c]" || remaining(key) != "[b]" {
+		t.Errorf("confirmed deletion: asked %v, left %s", asked, remaining(key))
+	}
+
+	key = setup()
+	asked = nil
+	captureOutput(t, func() int { return manageRecipes(key, choose("a"), confirm(false, &asked)) })
+	if remaining(key) != "[a b c]" {
+		t.Errorf("deleted although declined: left %s", remaining(key))
+	}
+
+	key = setup()
+	asked = nil
+	captureOutput(t, func() int { return manageRecipes(key, choose(), confirm(true, &asked)) })
+	if asked != nil || remaining(key) != "[a b c]" {
+		t.Errorf("nothing selected: asked %v, left %s", asked, remaining(key))
+	}
+
+	key = setup()
+	abortChoose := func([]string) ([]string, error) { return nil, huh.ErrUserAborted }
+	if _, _, code := captureOutput(t, func() int { return manageRecipes(key, abortChoose, confirm(true, &asked)) }); code != 130 || remaining(key) != "[a b c]" {
+		t.Errorf("abort while choosing: code %d, left %s", code, remaining(key))
+	}
+	abortConfirm := func([]string) (bool, error) { return false, huh.ErrUserAborted }
+	if _, _, code := captureOutput(t, func() int { return manageRecipes(key, choose("a"), abortConfirm) }); code != 130 || remaining(key) != "[a b c]" {
+		t.Errorf("abort while confirming: code %d, left %s", code, remaining(key))
+	}
+}
+
+func TestIsTerminalIsFalseForDevNullPipesAndFiles(t *testing.T) {
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Skip("no " + os.DevNull)
+	}
+	defer devNull.Close()
+	r, w, _ := os.Pipe()
+	defer r.Close()
+	defer w.Close()
+	file, _ := os.Create(filepath.Join(t.TempDir(), "f"))
+	defer file.Close()
+	for name, f := range map[string]*os.File{"/dev/null": devNull, "pipe": r, "regular file": file} {
+		if isTerminal(f) {
+			t.Errorf("isTerminal(%s) = true", name)
+		}
+	}
+}
+
+func TestSaveLastSavesUnderTheRepositoryItWasAskedFor(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	key := "github.com/o/r"
+	path, _ := lastRunPath(key)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("workflow: build.yml\n"), 0o600); err != nil { // no repo: line
+		t.Fatal(err)
+	}
+	captureOutput(t, func() int { return saveLastAsRecipe(key, func(string) (string, error) { return "staging", nil }) })
+	if _, err := loadRecipe(key, "staging"); err != nil {
+		t.Fatalf("recipe not saved for %s: %v (found: %v)", key, err, listRecipes(""))
+	}
+}
+
+func TestRememberDispatch(t *testing.T) {
+	key := "github.com/o/r"
+	origin := func() (string, error) { return key, nil }
+	noOrigin := func() (string, error) { return "", errors.New("no origin") }
+	d := dispatchRequest{Workflow: "build.yml", Inputs: map[string]string{"env": "staging"}}
+	fresh := func() {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	}
+	last := func() (recipe, bool) {
+		r, found, _ := loadLastRun(key)
+		return r, found
+	}
+
+	fresh()
+	captureOutput(t, func() int { rememberDispatch(false, origin, true, d); return 0 })
+	if r, found := last(); !found || r.Workflow != "build.yml" || r.Inputs["env"] != "staging" {
+		t.Errorf("understood dispatch: remembered %+v, %v", r, found)
+	}
+
+	fresh()
+	asked := false
+	captureOutput(t, func() int {
+		rememberDispatch(true, func() (string, error) { asked = true; return key, nil }, true, d)
+		return 0
+	})
+	if _, found := last(); found || asked {
+		t.Errorf("--repo run: remembered %v, looked up origin %v", found, asked)
+	}
+
+	fresh()
+	if err := rememberLastRun(recipe{Repo: key, Workflow: "older.yml"}); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, _ := captureOutput(t, func() int { rememberDispatch(false, origin, false, d); return 0 })
+	if _, found := last(); found {
+		t.Error("an older run was left as the last run after one that couldn't be read")
+	}
+	if !strings.Contains(stderr, "can't be saved as a recipe") || stdout != "" {
+		t.Errorf("no warning that the run can't be saved: stdout %q, stderr %q", stdout, stderr)
+	}
+
+	fresh()
+	_, stderr, _ = captureOutput(t, func() int { rememberDispatch(false, noOrigin, true, d); return 0 })
+	if _, found := last(); found || !strings.Contains(stderr, "no origin") {
+		t.Errorf("origin failure: remembered %v, stderr %q", found, stderr)
 	}
 }

@@ -14,10 +14,13 @@
 // on Windows, adding it to the user's PATH instead).
 // Every run, dispatched or watched, ends with a system notification (best effort).
 // --watch <run url> just watches that run to completion.
-// --capture asks for a name, runs as usual and saves the dispatch (minus the
-// branch) as a recipe; next time, a menu offers the repository's recipes (see recipe.go).
-// --recipe lists the repository's recipes; --recipe <name> runs that one
-// (matched case-insensitively) without the menu, or lists them if it isn't found.
+// Each run that isn't from a recipe is remembered; --save-last asks for a name and
+// saves it (minus the branch) as a recipe, after which a menu offers the
+// repository's recipes (see recipe.go).
+// --recipes lists the repository's recipes: interactively (tick some to delete them)
+// on a terminal, one per line otherwise.
+// --recipe <name> runs that recipe (matched case-insensitively) without the menu, or
+// lists the available ones if it isn't found; --recipe alone is an error pointing at --recipes.
 // --upgrade downloads the latest release for this machine and installs it over
 // the gharun on PATH (or to ~/.local/bin if there isn't one).
 // If --ref/-r is supplied, the branch prompt is skipped.
@@ -52,6 +55,7 @@ import (
 
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-isatty"
 )
 
 const (
@@ -145,9 +149,33 @@ func run(args []string) int {
 		return upgrade()
 	case opts.watchURL != "":
 		return watchURLRun(opts.watchURL)
+	case opts.recipes:
+		key, err := recipeRepoKey(opts.repo)
+		if err != nil {
+			fail(err.Error())
+			return 1
+		}
+		names := listRecipes(key)
+		if len(names) == 0 {
+			fmt.Fprintln(os.Stderr, "No recipes saved yet")
+		}
+		if len(names) > 0 && isTerminal(os.Stdin) && isTerminal(os.Stdout) {
+			return manageRecipes(key, chooseRecipesToDelete, confirmDeleteRecipes)
+		}
+		for _, n := range names {
+			fmt.Println(n)
+		}
+		return 0
+	case opts.saveLast:
+		key, err := originKey()
+		if err != nil {
+			fail(err.Error())
+			return 1
+		}
+		return saveLastAsRecipe(key, promptRecipeName)
 	}
 
-	// --recipe lists or picks a recipe up front, so a typo fails before any prompts.
+	// --recipe picks a recipe up front, so a typo fails before any prompts.
 	var recipeRepo string
 	var chosenRecipe *recipe
 	if opts.recipe {
@@ -157,20 +185,11 @@ func run(args []string) int {
 			return 1
 		}
 		names := listRecipes(key)
-		if opts.recipeName == "" {
-			if len(names) == 0 {
-				fmt.Fprintln(os.Stderr, "No recipes for "+key+" (make one with --capture)")
-			}
-			for _, n := range names {
-				fmt.Println(n)
-			}
-			return 0
-		}
 		name, ok := findRecipe(names, opts.recipeName)
 		if !ok {
 			fail("recipe not found: " + opts.recipeName)
 			if len(names) == 0 {
-				fmt.Fprintln(os.Stderr, "There are no recipes for "+key+" (make one with --capture)")
+				fmt.Fprintln(os.Stderr, "There are no recipes for "+key+" (run gharun, then gharun --save-last)")
 			} else {
 				fmt.Fprintln(os.Stderr, "Available recipes:")
 				for _, n := range names {
@@ -208,29 +227,9 @@ func run(args []string) int {
 		}
 	}
 	// Recipes belong to this checkout's origin remote (or the --repo one).
-	var captureName string
 	switch {
 	case chosenRecipe != nil:
 		// chosen with --recipe
-	case opts.capture && hasRepo:
-		fail("--capture needs a local checkout; it can't be combined with --repo")
-		return 1
-	case opts.capture:
-		key, err := originKey()
-		if err != nil {
-			fail(err.Error())
-			return 1
-		}
-		recipeRepo = key
-		name, err := promptRecipeName(key)
-		if err != nil {
-			if errors.Is(err, huh.ErrUserAborted) {
-				return 130
-			}
-			fail(err.Error())
-			return 1
-		}
-		captureName = name
 	case !hasRepo && len(opts.passthrough) == 0:
 		if key, err := originKey(); err == nil && len(listRecipes(key)) > 0 {
 			r, err := promptRecipe(key)
@@ -297,23 +296,15 @@ func run(args []string) int {
 		dispatched.Workflow = workflowFile(dispatched)
 		fmt.Println(dim.Render("Equivalent command:"))
 		fmt.Println("  " + dispatched.command())
-		if captureName != "" {
-			r := recipe{Name: captureName, Repo: recipeRepo, Workflow: dispatched.Workflow, Inputs: dispatched.Inputs}
-			if path, err := saveRecipe(r); err != nil {
-				fmt.Fprintln(os.Stderr, yellow.Render("Couldn't save the recipe: "+err.Error()))
-			} else {
-				fmt.Println(green.Render("Saved recipe " + path))
-			}
-		}
 	} else {
 		fmt.Fprintln(os.Stderr, yellow.Render(
 			"Couldn't read the dispatch request from gh's API log, so can't show the exact command."))
-		if captureName != "" {
-			fmt.Fprintln(os.Stderr, yellow.Render("No recipe was saved."))
-		}
 		if path := saveLog(ghLog); path != "" {
 			fmt.Fprintln(os.Stderr, dim.Render("gh's log is in "+path+" (the token is masked)"))
 		}
+	}
+	if chosenRecipe == nil {
+		rememberDispatch(hasRepo, originKey, understood, dispatched)
 	}
 
 	// gh prompts for the workflow and its inputs before it dispatches, which
@@ -836,7 +827,132 @@ func printBestGuess(ref string, passthrough []string, run workflowRun) {
 	fmt.Println("  " + cmd)
 }
 
-// promptRecipeName asks what to call the recipe being captured, and checks
+// rememberDispatch keeps what a run that wasn't from a recipe dispatched, for
+// --save-last. Recipes belong to the local checkout's origin, so --repo runs
+// have none. When the dispatch couldn't be read the previous remembered run is
+// dropped too, so --save-last never offers a run older than the last one.
+func rememberDispatch(hasRepo bool, originKey func() (string, error), understood bool, d dispatchRequest) {
+	if hasRepo {
+		return
+	}
+	key, err := originKey()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, yellow.Render("Couldn't remember this run for --save-last: "+err.Error()))
+		return
+	}
+	if !understood {
+		if err := forgetLastRun(key); err != nil {
+			fmt.Fprintln(os.Stderr, yellow.Render("Couldn't clear the remembered last run: "+err.Error()))
+		}
+		fmt.Fprintln(os.Stderr, yellow.Render(
+			"This run can't be saved as a recipe: what was dispatched couldn't be read from gh's API log."))
+		return
+	}
+	recordLastRun(recipe{Repo: key, Workflow: d.Workflow, Inputs: d.Inputs})
+}
+
+// saveLastAsRecipe shows the repository's remembered last run, asks (with
+// askName) what to call it and saves it as a recipe. The remembered run is
+// only forgotten once the recipe is written.
+func saveLastAsRecipe(repoKey string, askName func(repoKey string) (string, error)) int {
+	last, found, err := loadLastRun(repoKey)
+	if err != nil {
+		fail(err.Error())
+		return 1
+	}
+	if !found {
+		fmt.Fprintln(os.Stderr, "There is nothing to save: no run for "+repoKey+
+			" is waiting to be saved (it may already be a recipe). Run gharun first.")
+		return 1
+	}
+	fmt.Println(dim.Render("Last run for " + repoKey + ":"))
+	fmt.Println("  workflow: " + last.Workflow)
+	for _, k := range sortedKeys(last.Inputs) {
+		fmt.Printf("  input: %s=%s\n", k, inputEscaper.Replace(last.Inputs[k]))
+	}
+	name, err := askName(repoKey)
+	if err != nil {
+		if errors.Is(err, huh.ErrUserAborted) {
+			return 130
+		}
+		fail(err.Error())
+		return 1
+	}
+	last.Name, last.Repo = name, repoKey
+	path, err := saveRecipe(last)
+	if err != nil {
+		fail("couldn't save the recipe: " + err.Error())
+		return 1
+	}
+	fmt.Println(green.Render("Saved recipe " + path))
+	if err := forgetLastRun(repoKey); err != nil {
+		fmt.Fprintln(os.Stderr, yellow.Render("Saved, but couldn't clear the remembered last run: "+err.Error()))
+	}
+	return 0
+}
+
+// manageRecipes lets the user pick recipes (choose) and, once they have
+// agreed (confirm), deletes them. Nothing is deleted without both.
+func manageRecipes(repoKey string, choose func(names []string) ([]string, error), confirm func(names []string) (bool, error)) int {
+	selected, err := choose(listRecipes(repoKey))
+	if err == nil && len(selected) == 0 {
+		fmt.Println(dim.Render("Nothing selected; no recipes were deleted."))
+		return 0
+	}
+	var confirmed bool
+	if err == nil {
+		confirmed, err = confirm(selected)
+	}
+	if err != nil {
+		if errors.Is(err, huh.ErrUserAborted) {
+			return 130
+		}
+		fail(err.Error())
+		return 1
+	}
+	if !confirmed {
+		fmt.Println(dim.Render("No recipes were deleted."))
+		return 0
+	}
+	code := 0
+	for _, name := range selected {
+		if err := deleteRecipe(repoKey, name); err != nil {
+			fail("couldn't delete recipe " + name + ": " + err.Error())
+			code = 1
+			continue
+		}
+		fmt.Println(green.Render("Deleted recipe " + name))
+	}
+	return code
+}
+
+// chooseRecipesToDelete is a multi-select with nothing ticked to begin with.
+func chooseRecipesToDelete(names []string) ([]string, error) {
+	var selected []string
+	sel := huh.NewMultiSelect[string]().
+		Title("Recipes").
+		Description("space to tick the ones to delete, enter to continue; nothing is deleted yet").
+		Options(huh.NewOptions(names...)...).
+		Value(&selected)
+	if len(names) > 12 {
+		sel = sel.Height(15)
+	}
+	return selected, sel.Run()
+}
+
+func confirmDeleteRecipes(names []string) (bool, error) {
+	var ok bool
+	err := huh.NewConfirm().
+		Title(fmt.Sprintf("Delete %d recipe(s)?", len(names))).
+		Description("This can't be undone:\n  " + strings.Join(names, "\n  ")).
+		Affirmative("Delete").
+		Negative("Keep them").
+		Value(&ok).
+		Run()
+	return ok, err
+}
+
+// promptRecipeName asks what to call the recipe being saved, and checks
 // before an existing one of that name is replaced.
 func promptRecipeName(repoKey string) (string, error) {
 	existing := listRecipes(repoKey)
@@ -1215,9 +1331,10 @@ func firstLine(s string) string {
 	return line
 }
 
+// isTerminal is whether f is a real terminal; a character device test would
+// also say yes to /dev/null.
 func isTerminal(f *os.File) bool {
-	fi, err := f.Stat()
-	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+	return isatty.IsTerminal(f.Fd()) || isatty.IsCygwinTerminal(f.Fd())
 }
 
 func listRuns(ref string, user string, limit string) ([]workflowRun, error) {
@@ -1240,9 +1357,9 @@ func listRuns(ref string, user string, limit string) ([]workflowRun, error) {
 // options are gharun's own command line. Everything after "--" is kept
 // verbatim in passthrough for `gh workflow run`.
 type options struct {
-	help, version, install, upgrade, capture, recipe bool
-	ref, repo, watchURL, recipeName                  string
-	passthrough                                      []string
+	help, version, install, upgrade, saveLast, recipe, recipes bool
+	ref, repo, watchURL, recipeName                            string
+	passthrough                                                []string
 }
 
 const helpText = `gharun - dispatch a GitHub workflow on a branch and watch it run
@@ -1260,13 +1377,17 @@ Options:
   -r, --ref <branch>   run against this branch; skips the branch prompt
   -R, --repo <o/r>     use this repository (OWNER/REPO) instead of the current
                        one; skips the local uncommitted/unpushed checks
-      --capture        ask for a name, run as usual, and save how the workflow was
+      --save-last      don't dispatch anything: show the last run that didn't use
+                       a recipe, ask for a name, and save how the workflow was
                        dispatched (everything but the branch) as a recipe for this
                        repository's origin remote. Later runs offer a menu of the
                        recipes, plus "interactive" for the usual prompts. Recipes
                        are plain-text files in ~/.config/gharun/<repo>/ to edit by hand.
-      --recipe [name]  run the named recipe (case-insensitive) without the menu;
-                       with no name, list this repository's recipes and exit.
+      --recipes        list this repository's recipes (with --repo, that
+                       repository's). On a terminal, the list is interactive: tick
+                       recipes to delete them (asks first; it can't be undone).
+                       Otherwise the names are printed, one per line
+      --recipe <name>  run the named recipe (case-insensitive) without the menu.
                        With --repo, uses that repository's recipes
       --watch <url>    don't dispatch anything: watch the workflow run at this URL
                        (https://github.com/<owner>/<repo>/actions/runs/<id>) until
@@ -1323,10 +1444,7 @@ func parseArgs(args []string) (options, error) {
 		switch {
 		case a == "--":
 			o.passthrough = args[i+1:]
-			if o.recipe && len(o.passthrough) > 0 {
-				return o, errors.New("--recipe can't be combined with gh workflow run arguments")
-			}
-			return o, nil
+			return o, o.validate()
 		case a == "-h" || a == "--help":
 			o.help = true
 		case a == "--version":
@@ -1335,10 +1453,13 @@ func parseArgs(args []string) (options, error) {
 			o.install = true
 		case a == "--upgrade":
 			o.upgrade = true
-		case a == "--capture":
-			o.capture = true
+		case a == "--recipes":
+			o.recipes = true
+		case a == "--save-last":
+			o.saveLast = true
 		case a == "--recipe":
 			// the next argument is the name, unless it is another option
+			// (a missing name is reported by validate)
 			o.recipe = true
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
 				i++
@@ -1379,10 +1500,23 @@ func parseArgs(args []string) (options, error) {
 			return o, fmt.Errorf("unknown argument %q", a)
 		}
 	}
-	if o.recipe && o.capture {
-		return o, errors.New("--recipe and --capture can't be combined")
+	return o, o.validate()
+}
+
+// validate is why the options can't be used, if they can't: a missing recipe
+// name, or options that don't go together.
+func (o options) validate() error {
+	switch {
+	case o.recipe && o.recipeName == "":
+		return errors.New("--recipe needs the name of a recipe to run; use --recipes to see and manage your recipes")
+	case o.recipe && len(o.passthrough) > 0:
+		return errors.New("--recipe can't be combined with gh workflow run arguments")
+	case o.recipes && (o.recipe || o.saveLast || o.ref != "" || o.watchURL != "" || len(o.passthrough) > 0):
+		return errors.New("--recipes only lists recipes; it can be combined with --repo and nothing else")
+	case o.saveLast && (o.recipe || o.ref != "" || o.repo != "" || o.watchURL != "" || len(o.passthrough) > 0):
+		return errors.New("--save-last stands alone: it dispatches nothing, so it takes no other options")
 	}
-	return o, nil
+	return nil
 }
 
 func ghOutput(args ...string) (string, error) {

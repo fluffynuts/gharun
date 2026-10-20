@@ -184,6 +184,19 @@ func saveRecipe(r recipe) (string, error) {
 	return path, os.WriteFile(path, []byte(r.format()), 0o644)
 }
 
+// deleteRecipe removes a recipe by a name listRecipes gave. A recipe that is
+// already gone is an error: the user asked for something that didn't happen.
+func deleteRecipe(repoKey, name string) error {
+	if filepath.Base(name) != name {
+		return fmt.Errorf("%q is not a recipe name", name)
+	}
+	path, err := recipePath(repoKey, name)
+	if err != nil {
+		return err
+	}
+	return os.Remove(path)
+}
+
 func loadRecipe(repoKey, name string) (recipe, error) {
 	path, err := recipePath(repoKey, name)
 	if err != nil {
@@ -248,4 +261,104 @@ func parseRecipe(text string) (recipe, error) {
 		return r, errors.New("no workflow: line")
 	}
 	return r, nil
+}
+
+// The last non-recipe dispatch for each repository is remembered in
+// <state>/gharun/<repo>/.last (<state> is $XDG_STATE_HOME or ~/.local/state),
+// in the recipe file format, so --save-last can turn it into a recipe. It is
+// kept apart from the recipes: those are config the user keeps, this is
+// scratch state that is overwritten by the next run.
+
+func lastRunPath(repoKey string) (string, error) {
+	state := os.Getenv("XDG_STATE_HOME")
+	if state == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		state = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(state, "gharun", strings.ReplaceAll(repoKey, "/", "__"), ".last"), nil
+}
+
+func rememberLastRun(r recipe) error {
+	path, err := lastRunPath(r.Repo)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(r.format()), 0o600)
+}
+
+func loadLastRun(repoKey string) (recipe, bool, error) {
+	path, err := lastRunPath(repoKey)
+	if err != nil {
+		return recipe{}, false, err
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return recipe{}, false, nil
+	}
+	if err != nil {
+		return recipe{}, false, err
+	}
+	r, err := parseRecipe(string(data))
+	if err != nil {
+		return recipe{}, false, fmt.Errorf("%s: %w", path, err)
+	}
+	return r, true, nil
+}
+
+func forgetLastRun(repoKey string) error {
+	path, err := lastRunPath(repoKey)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// sameDispatch is whether two recipes run the same workflow with the same inputs.
+func sameDispatch(a, b recipe) bool {
+	if a.Workflow != b.Workflow || len(a.Inputs) != len(b.Inputs) {
+		return false
+	}
+	for k, v := range a.Inputs {
+		if other, ok := b.Inputs[k]; !ok || other != v {
+			return false
+		}
+	}
+	return true
+}
+
+// hasRecipeFor is whether some recipe of the repository already dispatches
+// what r does. Recipes that can't be read are not matches.
+func hasRecipeFor(r recipe) bool {
+	for _, name := range listRecipes(r.Repo) {
+		if existing, err := loadRecipe(r.Repo, name); err == nil && sameDispatch(existing, r) {
+			return true
+		}
+	}
+	return false
+}
+
+// recordLastRun remembers r as the repository's last run and points the user
+// at --save-last. A run that is already a recipe is not worth offering, and
+// replaces (by clearing) whatever older run was remembered.
+func recordLastRun(r recipe) {
+	if hasRecipeFor(r) {
+		if err := forgetLastRun(r.Repo); err != nil {
+			fmt.Fprintln(os.Stderr, yellow.Render("Couldn't clear the remembered last run: "+err.Error()))
+		}
+		return
+	}
+	if err := rememberLastRun(r); err != nil {
+		fmt.Fprintln(os.Stderr, yellow.Render("Couldn't remember this run, so --save-last won't have it: "+err.Error()))
+		return
+	}
+	fmt.Println(dim.Render("To keep this as a recipe, run: gharun --save-last"))
 }
