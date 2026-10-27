@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -37,34 +38,24 @@ func TestUpgradeInstallsLatestRelease(t *testing.T) {
 	zw.Close()
 	sum := sha256.Sum256(buf.Bytes())
 
-	serve := func(sums string) *httptest.Server {
-		return httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/" + asset:
-				rw.Write(buf.Bytes())
-			case "/SHA256SUMS":
-				fmt.Fprint(rw, sums)
-			default:
-				http.NotFound(rw, r)
-			}
-		}))
-	}
-
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("PATH", "") // no gharun on PATH: upgrade installs to ~/.local/bin
+	setVersion(t, "0.1", "8")
 
-	bad := serve(fmt.Sprintf("%064x  %s\n", 0, asset))
-	defer bad.Close()
-	t.Setenv("GHARUN_RELEASE_URL", bad.URL)
+	t.Setenv("GHARUN_RELEASE_URL", serveReleases(t, "v0.1.9", map[string][]byte{
+		asset:        buf.Bytes(),
+		"SHA256SUMS": []byte(fmt.Sprintf("%064x  %s\n", 0, asset)),
+	}))
 	if code := upgrade(); code == 0 {
 		t.Fatal("upgrade accepted a checksum mismatch")
 	}
 
-	good := serve(fmt.Sprintf("%x  %s\n", sum, asset))
-	defer good.Close()
-	t.Setenv("GHARUN_RELEASE_URL", good.URL)
+	t.Setenv("GHARUN_RELEASE_URL", serveReleases(t, "v0.1.9", map[string][]byte{
+		asset:        buf.Bytes(),
+		"SHA256SUMS": []byte(fmt.Sprintf("%x  %s\n", sum, asset)),
+	}))
 	if code := upgrade(); code != 0 {
 		t.Fatalf("upgrade exited %d", code)
 	}
@@ -72,6 +63,72 @@ func TestUpgradeInstallsLatestRelease(t *testing.T) {
 	if err != nil || string(got) != "new binary" {
 		t.Fatalf("installed binary = %q, %v", got, err)
 	}
+}
+
+func TestUpgradeDoesNothingWhenAlreadyOnTheLatestRelease(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("PATH", "")
+	setVersion(t, "0.1", "9")
+	// No assets: any download fails the upgrade.
+	t.Setenv("GHARUN_RELEASE_URL", serveReleases(t, "v0.1.9", nil))
+
+	if code := upgrade(); code != 0 {
+		t.Fatalf("upgrade exited %d", code)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".local", "bin")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("upgrade installed something when already up to date (stat: %v)", err)
+	}
+}
+
+func TestNewerVersion(t *testing.T) {
+	cases := []struct {
+		latest, running string
+		want            bool
+	}{
+		{"0.1.9", "0.1.8", true},
+		{"0.1.9", "0.1.9", false},
+		{"0.1.9", "0.1.10", false},
+		{"0.2.1", "0.1.99", true},
+		{"0.1.9", "0.1", true}, // a local build of 0.1 predates every 0.1 release
+		{"0.1.9", "", true},    // a dev build with no version at all
+	}
+	for _, c := range cases {
+		if got := newerVersion(c.latest, c.running); got != c.want {
+			t.Errorf("newerVersion(%q, %q) = %v, want %v", c.latest, c.running, got, c.want)
+		}
+	}
+}
+
+// setVersion stands in for the version make.sh bakes in, for the rest of t.
+func setVersion(t *testing.T, version, build string) {
+	t.Helper()
+	oldVersion, oldBuild := Version, Build
+	t.Cleanup(func() { Version, Build = oldVersion, oldBuild })
+	Version, Build = version, build
+}
+
+// serveReleases stands in for GitHub's releases page, whose latest release
+// is tag with assets (name → content): /releases/latest redirects to the
+// tag, and each asset is at /releases/download/<tag>/<name>. It returns the
+// releases page's URL.
+func serveReleases(t *testing.T, tag string, assets map[string][]byte) string {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases/latest", func(rw http.ResponseWriter, r *http.Request) {
+		http.Redirect(rw, r, "/releases/tag/"+tag, http.StatusFound)
+	})
+	mux.HandleFunc("/releases/download/"+tag+"/", func(rw http.ResponseWriter, r *http.Request) {
+		if content, ok := assets[path.Base(r.URL.Path)]; ok {
+			rw.Write(content)
+			return
+		}
+		http.NotFound(rw, r)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv.URL + "/releases"
 }
 
 func TestUpgradeTargetIsTheGharunOnPath(t *testing.T) {

@@ -21,8 +21,8 @@
 // on a terminal, one per line otherwise.
 // --recipe <name> runs that recipe (matched case-insensitively) without the menu, or
 // lists the available ones if it isn't found; --recipe alone is an error pointing at --recipes.
-// --upgrade downloads the latest release for this machine and installs it over
-// the gharun on PATH (or to ~/.local/bin if there isn't one).
+// --upgrade, when there's a newer release, downloads it for this machine and
+// installs it over the gharun on PATH (or to ~/.local/bin if there isn't one).
 // If --ref/-r is supplied, the branch prompt is skipped.
 // Before dispatching, the checked-out branch must exist on the remote (else
 // exit 1), and uncommitted or unpushed work needs confirming.
@@ -64,7 +64,7 @@ const (
 	discoverTimeout      = 90 * time.Second
 	discoverSlack        = 20 * time.Second
 	maxConsecutiveErrors = 5
-	releaseURL           = "https://github.com/fluffynuts/gharun/releases/latest/download"
+	releasesURL          = "https://github.com/fluffynuts/gharun/releases"
 	snapshotLimit        = "50"
 	discoverLimit        = "20"
 )
@@ -84,15 +84,22 @@ var (
 	BuiltAt = ""
 )
 
+// fullVersion is Version with the build number, when there is one: "0.1.57",
+// "0.1" for a local build, "" for a build with no version baked in.
+func fullVersion() string {
+	if Version == "" || Build == "" {
+		return Version
+	}
+	return Version + "." + Build
+}
+
 // versionString is "gharun 0.1.2 (abc1234 built at 2026-10-05T12:00:00Z)".
 // Anything not injected at build time falls back to what the go tool embeds
 // (the commit) or "unknown".
 func versionString() string {
-	version := Version
+	version := fullVersion()
 	if version == "" {
 		version = "dev"
-	} else if Build != "" {
-		version += "." + Build
 	}
 	commit := Commit
 	if commit == "" {
@@ -464,10 +471,30 @@ func warnNotOnPath(dir string) {
 	}
 }
 
-// upgrade downloads the latest release's zip for this OS/arch, checks it
-// against the release's SHA256SUMS, and installs the binary inside it over the
-// gharun on PATH (or to ~/.local/bin if there isn't one).
+// upgrade, when the latest release is newer than this gharun, downloads its
+// zip for this OS/arch, checks it against the release's SHA256SUMS, and
+// installs the binary inside it over the gharun on PATH (or to ~/.local/bin if
+// there isn't one).
 func upgrade() int {
+	releases := os.Getenv("GHARUN_RELEASE_URL")
+	if releases == "" {
+		releases = releasesURL
+	}
+	tag, err := latestTag(releases)
+	if err != nil {
+		fail(err.Error())
+		return 1
+	}
+	latest, running := strings.TrimPrefix(tag, "v"), fullVersion()
+	if !newerVersion(latest, running) {
+		fmt.Println(green.Render("gharun " + running + " is the latest"))
+		return 0
+	}
+	if running == "" {
+		running = "dev"
+	}
+	fmt.Println(dim.Render("Upgrading gharun " + running + " to " + latest))
+
 	dest, err := upgradeTarget()
 	if err != nil {
 		fail(err.Error())
@@ -478,10 +505,9 @@ func upgrade() int {
 		osName = "macos"
 	}
 	asset := fmt.Sprintf("gharun-%s-%s.zip", osName, runtime.GOARCH)
-	base := os.Getenv("GHARUN_RELEASE_URL")
-	if base == "" {
-		base = releaseURL
-	}
+	// Everything comes from the one tag, so a release published mid-upgrade
+	// can't mix versions.
+	base := releases + "/download/" + tag
 
 	fmt.Println(dim.Render("Downloading " + base + "/" + asset))
 	zipData, err := httpGet(base + "/" + asset)
@@ -512,6 +538,64 @@ func upgrade() int {
 		return 1
 	}
 	return installTo(extracted, dest)
+}
+
+// latestTag returns the latest release's tag ("v0.1.57"), read from where
+// <releases>/latest redirects to. That avoids GitHub's API, which limits
+// anonymous callers to 60 requests an hour.
+func latestTag(releases string) (string, error) {
+	client := http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Get(releases + "/latest")
+	if err != nil {
+		return "", fmt.Errorf("asking GitHub for the latest release: %w", err)
+	}
+	resp.Body.Close()
+	loc := resp.Header.Get("Location")
+	if resp.StatusCode < 300 || resp.StatusCode >= 400 || !strings.Contains(loc, "/releases/tag/") {
+		return "", fmt.Errorf("asking GitHub for the latest release: got %s, not a redirect to a release", resp.Status)
+	}
+	tag := path.Base(loc)
+	if tag == "" || tag == "tag" {
+		return "", fmt.Errorf("asking GitHub for the latest release: can't read a tag from %s", loc)
+	}
+	return tag, nil
+}
+
+// newerVersion reports whether release version latest ("0.1.57") is newer
+// than running. A part running lacks sorts below any real one, so a local
+// build ("0.1", or "" with no version at all) is older than every release.
+func newerVersion(latest, running string) bool {
+	l, r := versionParts(latest), versionParts(running)
+	for i := 0; i < max(len(l), len(r)); i++ {
+		if lv, rv := versionPart(l, i), versionPart(r, i); lv != rv {
+			return lv > rv
+		}
+	}
+	return false
+}
+
+func versionParts(v string) []int {
+	if v == "" {
+		return nil
+	}
+	var out []int
+	for _, p := range strings.Split(v, ".") {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			n = -1
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+func versionPart(parts []int, i int) int {
+	if i < len(parts) {
+		return parts[i]
+	}
+	return -1
 }
 
 func httpGet(url string) ([]byte, error) {
@@ -1396,9 +1480,9 @@ Options:
       --install        copy this binary to ~/.local/bin and exit; warns if that
                        folder is not in your PATH (on Windows, adds it to your
                        user PATH instead)
-      --upgrade        download the latest release for this machine, install it
-                       over the gharun found in your PATH (or to ~/.local/bin if
-                       there isn't one) and exit
+      --upgrade        if there's a newer release, download it for this machine and
+                       install it over the gharun found in your PATH (or to
+                       ~/.local/bin if there isn't one); then exit
   -h, --help           show this help and exit
 
 Passing arguments to gh workflow run:
