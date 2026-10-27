@@ -23,6 +23,8 @@
 // lists the available ones if it isn't found; --recipe alone is an error pointing at --recipes.
 // --upgrade, when there's a newer release, downloads it for this machine and
 // installs it over the gharun on PATH (or to ~/.local/bin if there isn't one).
+// Watching a run also checks for a newer release in the background, and ends
+// by suggesting --upgrade if there is one.
 // If --ref/-r is supplied, the branch prompt is skipped.
 // Before dispatching, the checked-out branch must exist on the remote (else
 // exit 1), and uncommitted or unpushed work needs confirming.
@@ -64,6 +66,7 @@ import (
 const (
 	statePollInterval    = 5 * time.Second
 	statePollTimeout     = 30 * time.Second
+	latestTagTimeout     = 10 * time.Second
 	discoverPollInterval = 3 * time.Second
 	discoverTimeout      = 90 * time.Second
 	discoverSlack        = 20 * time.Second
@@ -486,10 +489,7 @@ func warnNotOnPath(dir string) {
 // installs the binary inside it over the gharun on PATH (or to ~/.local/bin if
 // there isn't one).
 func upgrade() int {
-	releases := os.Getenv("GHARUN_RELEASE_URL")
-	if releases == "" {
-		releases = releasesURL
-	}
+	releases := releasesPage()
 	tag, err := latestTag(releases)
 	if err != nil {
 		fail(err.Error())
@@ -550,13 +550,74 @@ func upgrade() int {
 	return installTo(extracted, dest)
 }
 
+// releasesPage is gharun's GitHub releases page, or GHARUN_RELEASE_URL when
+// set (a stand-in, for tests).
+func releasesPage() string {
+	if releases := os.Getenv("GHARUN_RELEASE_URL"); releases != "" {
+		return releases
+	}
+	return releasesURL
+}
+
+// upgradeCheck is a background check for a newer release, so that watching
+// a run can end by saying there is one (see upgradeHint).
+type upgradeCheck struct {
+	done chan struct{}
+	hint string
+}
+
+func startUpgradeCheck(releases, version, build string) *upgradeCheck {
+	c := &upgradeCheck{done: make(chan struct{})}
+	go func() {
+		c.hint = upgradeHint(releases, version, build)
+		close(c.done)
+	}()
+	return c
+}
+
+func (c *upgradeCheck) wait() { <-c.done }
+
+// report prints the hint to w, if the check has found one. It never waits:
+// an unfinished check says nothing, rather than holding up gharun's exit.
+func (c *upgradeCheck) report(w io.Writer) {
+	select {
+	case <-c.done:
+		if c.hint != "" {
+			fmt.Fprintln(w, yellow.Render(c.hint))
+		}
+	default:
+	}
+}
+
+// upgradeHint suggests --upgrade when the latest release is newer than
+// version.build, or is "". A local build (no build number) gets no hint: its
+// version sorts before every release of it, so it would always get one. A
+// failed check gets none either; it's only a hint.
+func upgradeHint(releases, version, build string) string {
+	if build == "" {
+		return ""
+	}
+	tag, err := latestTag(releases)
+	if err != nil {
+		return ""
+	}
+	running, latest := version+"."+build, strings.TrimPrefix(tag, "v")
+	if !newerVersion(latest, running) {
+		return ""
+	}
+	return fmt.Sprintf("gharun %s → %s is available; run 'gharun --upgrade' to install it", running, latest)
+}
+
 // latestTag returns the latest release's tag ("v0.1.57"), read from where
 // <releases>/latest redirects to. That avoids GitHub's API, which limits
 // anonymous callers to 60 requests an hour.
 func latestTag(releases string) (string, error) {
-	client := http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
+	client := http.Client{
+		Timeout: latestTagTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	resp, err := client.Get(releases + "/latest")
 	if err != nil {
 		return "", fmt.Errorf("asking GitHub for the latest release: %w", err)
@@ -1274,8 +1335,11 @@ type pollResult struct {
 // the clock keeps moving even though polls are slow; polls run in the
 // background so they never stall it, and one that takes longer than
 // statePollTimeout counts as a poll error. When stdout isn't a terminal, a
-// line is printed only when the status or a poll error changes.
+// line is printed only when the status or a poll error changes. Meanwhile it
+// checks for a newer gharun, and says so at the end if it has found one.
 func watch(id int64) int {
+	upgrades := startUpgradeCheck(releasesPage(), Version, Build)
+	defer upgrades.report(os.Stderr)
 	idStr := fmt.Sprintf("%d", id)
 	started := time.Now()
 

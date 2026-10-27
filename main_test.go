@@ -132,6 +132,54 @@ func serveReleases(t *testing.T, tag string, assets map[string][]byte) string {
 	return srv.URL + "/releases"
 }
 
+func TestUpgradeHint(t *testing.T) {
+	releases := serveReleases(t, "v0.1.12", nil)
+	if got, want := upgradeHint(releases, "0.1", "11"), "gharun 0.1.11 → 0.1.12 is available; run 'gharun --upgrade' to install it"; got != want {
+		t.Errorf("with a newer release, upgradeHint = %q, want %q", got, want)
+	}
+	if got := upgradeHint(releases, "0.1", "12"); got != "" {
+		t.Errorf("on the latest release, upgradeHint = %q, want nothing", got)
+	}
+	// A local build's version predates every release of it, so it would
+	// always be told to upgrade, very likely to what it was built from.
+	if got := upgradeHint(releases, "0.1", ""); got != "" {
+		t.Errorf("for a local build, upgradeHint = %q, want nothing", got)
+	}
+
+	gone := httptest.NewServer(http.NotFoundHandler())
+	gone.Close()
+	if got := upgradeHint(gone.URL+"/releases", "0.1", "11"); got != "" {
+		t.Errorf("when the check fails, upgradeHint = %q, want nothing", got)
+	}
+}
+
+func TestUpgradeCheckDoesNotWaitForGitHub(t *testing.T) {
+	answer := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		<-answer
+		http.Redirect(rw, r, "/releases/tag/v0.1.12", http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(answer) }) // runs first, so srv.Close isn't left waiting
+
+	check := startUpgradeCheck(srv.URL+"/releases", "0.1", "11")
+	var out bytes.Buffer
+	check.report(&out)
+	if out.Len() != 0 {
+		t.Errorf("report printed %q before the check had finished", out.String())
+	}
+}
+
+func TestUpgradeCheckReportsAFinishedCheck(t *testing.T) {
+	check := startUpgradeCheck(serveReleases(t, "v0.1.12", nil), "0.1", "11")
+	check.wait()
+	var out bytes.Buffer
+	check.report(&out)
+	if want := "gharun 0.1.11 → 0.1.12 is available; run 'gharun --upgrade' to install it\n"; out.String() != want {
+		t.Errorf("report printed %q, want %q", out.String(), want)
+	}
+}
+
 func TestUpgradeTargetIsTheGharunOnPath(t *testing.T) {
 	exe := "gharun"
 	if runtime.GOOS == "windows" {
