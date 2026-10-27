@@ -32,6 +32,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -55,12 +56,14 @@ import (
 
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/term"
 	"github.com/mattn/go-isatty"
 )
 
 const (
 	statePollInterval    = 5 * time.Second
+	statePollTimeout     = 30 * time.Second
 	discoverPollInterval = 3 * time.Second
 	discoverTimeout      = 90 * time.Second
 	discoverSlack        = 20 * time.Second
@@ -1269,16 +1272,16 @@ type pollResult struct {
 // one-second tick redraws a single status line ("[00:31] running: 1/3 jobs
 // done; build in progress", see runProgress), cut to the terminal's width, so
 // the clock keeps moving even though polls are slow; polls run in the
-// background so they never stall it. When stdout isn't a terminal, a line is
-// printed only when the status changes.
+// background so they never stall it, and one that takes longer than
+// statePollTimeout counts as a poll error. When stdout isn't a terminal, a
+// line is printed only when the status or a poll error changes.
 func watch(id int64) int {
 	idStr := fmt.Sprintf("%d", id)
 	started := time.Now()
-	live := isTerminal(os.Stdout)
 
 	status := "waiting"
 	note := ""
-	lastPrinted := ""
+	line := statusLine{w: os.Stdout, live: isTerminal(os.Stdout)}
 	// Once the run is going, the clock shows how long the workflow has run
 	// (by GitHub's timestamps, corrected for our clock's skew from GitHub's).
 	skew := githubNow().Sub(time.Now())
@@ -1286,25 +1289,19 @@ func watch(id int64) int {
 	var current *workflowRun
 	render := func() {
 		clock := "[" + formatClock(clockElapsed(started, time.Now(), skew, runStart, runEnd)) + "] "
+		width := 0
+		if line.live {
+			width = terminalWidth()
+		}
 		if current != nil {
-			width := 0
-			if live {
-				width = lineBudget(terminalWidth(), clock+note)
-			}
-			status, _ = runProgress(*current, width)
+			status, _ = runProgress(*current, lineBudget(width, clock+note))
 		}
-		line := clock + status + note
-		if live {
-			fmt.Print("\r\x1b[2K" + dim.Render(line))
-		} else if status != lastPrinted {
-			fmt.Println(dim.Render(line))
-		}
-		lastPrinted = status
+		line.show(clock, status, note, width)
 	}
 	// finish ends the status line, leaving its last state on screen.
 	finish := func() {
 		render()
-		if live {
+		if line.live {
 			fmt.Println()
 		}
 	}
@@ -1314,7 +1311,7 @@ func watch(id int64) int {
 	poll := func() {
 		polling = true
 		go func() {
-			out, err := ghOutput("run", "view", idStr, "--json", "status,conclusion,url,workflowName,startedAt,updatedAt,jobs")
+			out, err := commandOutputWithin(statePollTimeout, "gh", "run", "view", idStr, "--json", "status,conclusion,url,workflowName,startedAt,updatedAt,jobs")
 			var r workflowRun
 			if err == nil {
 				if jerr := json.Unmarshal([]byte(out), &r); jerr != nil {
@@ -1342,10 +1339,10 @@ func watch(id int64) int {
 			nextPoll = time.Now().Add(statePollInterval)
 			if res.err != nil {
 				errorCount++
-				note = fmt.Sprintf(" (poll error %d/%d: %s)", errorCount, maxConsecutiveErrors, firstLine(res.err.Error()))
+				note = fmt.Sprintf(" (poll error %d/%d: %s)", errorCount, maxConsecutiveErrors, pollErrorReason(res.err))
 				if errorCount >= maxConsecutiveErrors {
 					finish()
-					fail("giving up after repeated poll errors")
+					fail(fmt.Sprintf("giving up after %d poll errors in a row; the last was: %v", errorCount, res.err))
 					return 1
 				}
 				render()
@@ -1383,6 +1380,42 @@ func watch(id int64) int {
 			return 1
 		}
 	}
+}
+
+// statusLine shows watch's status line on w: redrawn in place on a terminal,
+// cut to fit; otherwise as a new line each time its status or note changes
+// (the clock moving doesn't count).
+type statusLine struct {
+	w    io.Writer
+	live bool
+	last string
+}
+
+// show shows clock, status and note (a poll error, or ""). width is the
+// terminal's, or 0 if unknown. When they don't all fit, the status is cut
+// before the note: a poll error matters more than which jobs are running.
+func (s *statusLine) show(clock, status, note string, width int) {
+	text := status + note
+	if s.live {
+		if room := lineBudget(width, clock); room > 0 {
+			note = ansi.Truncate(note, room, "…")
+			status = ansi.Truncate(status, max(room-lipgloss.Width(note), 0), "…")
+		}
+		fmt.Fprint(s.w, "\r\x1b[2K"+dim.Render(clock+status+note))
+	} else if text != s.last {
+		fmt.Fprintln(s.w, dim.Render(clock+text))
+	}
+	s.last = text
+}
+
+// pollErrorReason is why a poll failed, short enough for the status line:
+// what gh said, or that it timed out, without the whole command.
+func pollErrorReason(err error) string {
+	var cmdErr *commandError
+	if errors.As(err, &cmdErr) {
+		return cmdErr.reason()
+	}
+	return firstLine(err.Error())
 }
 
 // runProgress describes run for the status line, and reports whether it has
@@ -1698,15 +1731,68 @@ func gitOutput(args ...string) (string, error) {
 }
 
 func commandOutput(name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
+	return output(exec.Command(name, args...))
+}
+
+// commandOutputWithin is commandOutput, killing the command if it hasn't
+// finished within timeout.
+func commandOutputWithin(timeout time.Duration, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	// Without this, a child the command started that still holds its output
+	// open would keep us waiting after the kill.
+	cmd.WaitDelay = time.Second
+	out, err := output(cmd)
+	var cmdErr *commandError
+	if ctx.Err() == context.DeadlineExceeded && errors.As(err, &cmdErr) {
+		cmdErr.timeout = timeout
+	}
+	return out, err
+}
+
+func output(cmd *exec.Cmd) (string, error) {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("%s %s: %w: %s",
-			name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return "", &commandError{
+			command: strings.Join(cmd.Args, " "),
+			err:     err,
+			stderr:  strings.TrimSpace(stderr.String()),
+		}
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// commandError is a command that failed: it ran for longer than timeout (when
+// set), or err says how it ended, and stderr is what it said.
+type commandError struct {
+	command string
+	err     error
+	stderr  string
+	timeout time.Duration
+}
+
+func (e *commandError) Error() string {
+	if e.timeout > 0 {
+		return e.command + ": " + e.reason()
+	}
+	return fmt.Sprintf("%s: %v: %s", e.command, e.err, e.stderr)
+}
+
+func (e *commandError) Unwrap() error { return e.err }
+
+// reason is why the command failed, without the command itself.
+func (e *commandError) reason() string {
+	switch {
+	case e.timeout > 0:
+		return fmt.Sprintf("timed out after %s", e.timeout)
+	case e.stderr != "":
+		return firstLine(e.stderr)
+	default:
+		return e.err.Error()
+	}
 }
 
 func nonEmptyLines(s string) []string {

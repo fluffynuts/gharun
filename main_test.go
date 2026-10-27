@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/huh"
+	"github.com/charmbracelet/lipgloss"
 )
 
 func TestUpgradeInstallsLatestRelease(t *testing.T) {
@@ -503,6 +504,87 @@ func TestRunProgress(t *testing.T) {
 		if got != c.want || started != c.wantStarted {
 			t.Errorf("%s: runProgress = %q, %v; want %q, %v", c.name, got, started, c.want, c.wantStarted)
 		}
+	}
+}
+
+func TestCommandOutputWithinGivesUpOnAHungCommand(t *testing.T) {
+	if os.Getenv("GHARUN_TEST_HANG") == "1" {
+		time.Sleep(time.Minute)
+		return
+	}
+	t.Setenv("GHARUN_TEST_HANG", "1")
+	started := time.Now()
+	_, err := commandOutputWithin(200*time.Millisecond, os.Args[0], "-test.run=^TestCommandOutputWithinGivesUpOnAHungCommand$")
+	if err == nil || !strings.Contains(err.Error(), "timed out after 200ms") {
+		t.Fatalf("err = %v, want a timeout", err)
+	}
+	if took := time.Since(started); took > 10*time.Second {
+		t.Fatalf("took %v to give up", took)
+	}
+	if got := pollErrorReason(err); got != "timed out after 200ms" {
+		t.Errorf("pollErrorReason = %q, want just the timeout", got)
+	}
+}
+
+func TestPollErrorReasonIsWhatTheCommandSaid(t *testing.T) {
+	if os.Getenv("GHARUN_TEST_FAIL") == "1" {
+		fmt.Fprintln(os.Stderr, "HTTP 502: Bad Gateway (https://api.github.com/...)")
+		fmt.Fprintln(os.Stderr, "try again later")
+		os.Exit(1)
+	}
+	t.Setenv("GHARUN_TEST_FAIL", "1")
+	_, err := commandOutputWithin(time.Minute, os.Args[0], "-test.run=^TestPollErrorReasonIsWhatTheCommandSaid$")
+	if err == nil {
+		t.Fatal("a failing command succeeded")
+	}
+	if got := pollErrorReason(err); got != "HTTP 502: Bad Gateway (https://api.github.com/...)" {
+		t.Errorf("pollErrorReason = %q, want the first line of its stderr", got)
+	}
+	if got := pollErrorReason(errors.New("parsing run state: bad json\nmore")); got != "parsing run state: bad json" {
+		t.Errorf("pollErrorReason of another error = %q, want its first line", got)
+	}
+}
+
+func TestStatusLinePipedPrintsChangesOnly(t *testing.T) {
+	var out bytes.Buffer
+	s := statusLine{w: &out}
+	s.show("[00:01] ", "queued", "", 0)
+	s.show("[00:02] ", "queued", "", 0) // only the clock moved
+	s.show("[00:35] ", "queued", " (poll error 1/5: timed out after 30s)", 0)
+	s.show("[01:10] ", "queued", " (poll error 2/5: timed out after 30s)", 0)
+	s.show("[01:15] ", "queued", "", 0)
+	want := "[00:01] queued\n" +
+		"[00:35] queued (poll error 1/5: timed out after 30s)\n" +
+		"[01:10] queued (poll error 2/5: timed out after 30s)\n" +
+		"[01:15] queued\n"
+	if got := out.String(); got != want {
+		t.Errorf("printed:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestStatusLineLiveStaysWithinTheTerminal(t *testing.T) {
+	var out bytes.Buffer
+	s := statusLine{w: &out, live: true}
+	s.show("[00:35] ", "running: 3/4 jobs done; +1 more", "", 30)
+	got := out.String()
+	if !strings.HasPrefix(got, "\r\x1b[2K") {
+		t.Fatalf("live line %q doesn't redraw in place", got)
+	}
+	if w := lipgloss.Width(strings.TrimPrefix(got, "\r\x1b[2K")); w >= 30 {
+		t.Errorf("live line %q is %d wide; a 30-column terminal would wrap it", got, w)
+	}
+}
+
+func TestStatusLineLiveKeepsAPollErrorInView(t *testing.T) {
+	var out bytes.Buffer
+	s := statusLine{w: &out, live: true}
+	s.show("[00:35] ", "running: 3/4 jobs done; +1 more", " (poll error 1/5: timed out after 30s)", 60)
+	got := strings.TrimPrefix(out.String(), "\r\x1b[2K")
+	if w := lipgloss.Width(got); w >= 60 {
+		t.Errorf("live line %q is %d wide; a 60-column terminal would wrap it", got, w)
+	}
+	if !strings.HasSuffix(got, " (poll error 1/5: timed out after 30s)") {
+		t.Errorf("live line %q cut off the poll error rather than the status", got)
 	}
 }
 
