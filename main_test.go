@@ -444,6 +444,68 @@ func TestClockElapsed(t *testing.T) {
 	}
 }
 
+func TestRunProgress(t *testing.T) {
+	job := func(name, status string) workflowJob { return workflowJob{Name: name, Status: status} }
+	cases := []struct {
+		name        string
+		run         workflowRun
+		width       int
+		want        string
+		wantStarted bool
+	}{
+		{
+			name: "nothing started yet",
+			run:  workflowRun{Status: "queued", Jobs: []workflowJob{job("test", "queued")}},
+			want: "queued",
+		},
+		{
+			name: "no jobs yet",
+			run:  workflowRun{Status: "queued"},
+			want: "queued",
+		},
+		{
+			name:        "a job running",
+			run:         workflowRun{Status: "in_progress", Jobs: []workflowJob{job("check", "completed"), job("build (24.x)", "in_progress"), job("test (24.x)", "in_progress"), job("deploy", "queued")}},
+			want:        "running: 1/4 jobs done; build (24.x) in progress; test (24.x) in progress; deploy waiting for a runner",
+			wantStarted: true,
+		},
+		{
+			// GitHub calls the run queued while a later job waits for a runner,
+			// however much of it has already run.
+			name:        "queued run with jobs done",
+			run:         workflowRun{Status: "queued", Jobs: []workflowJob{job("check-master-merge", "completed"), job("test (24.x)", "queued"), job("build-and-push (24.x)", "completed"), job("deploy-without-tests", "completed")}},
+			want:        "running: 3/4 jobs done; test (24.x) waiting for a runner",
+			wantStarted: true,
+		},
+		{
+			name:        "waiting on an environment's approval",
+			run:         workflowRun{Status: "waiting", Jobs: []workflowJob{job("build", "completed"), job("deploy", "waiting")}},
+			want:        "running: 1/2 jobs done; deploy waiting for approval",
+			wantStarted: true,
+		},
+		{
+			name:        "too narrow for every job",
+			run:         workflowRun{Status: "in_progress", Jobs: []workflowJob{job("aaaa", "in_progress"), job("bbbb", "in_progress"), job("cccc", "in_progress")}},
+			width:       len("running: 0/3 jobs done; aaaa in progress; +2 more") + 3,
+			want:        "running: 0/3 jobs done; aaaa in progress; +2 more",
+			wantStarted: true,
+		},
+		{
+			name:        "too narrow for any job",
+			run:         workflowRun{Status: "in_progress", Jobs: []workflowJob{job("a-very-long-job-name", "in_progress")}},
+			width:       len("running: 0/1 jobs done; +1 more"),
+			want:        "running: 0/1 jobs done; +1 more",
+			wantStarted: true,
+		},
+	}
+	for _, c := range cases {
+		got, started := runProgress(c.run, c.width)
+		if got != c.want || started != c.wantStarted {
+			t.Errorf("%s: runProgress = %q, %v; want %q, %v", c.name, got, started, c.want, c.wantStarted)
+		}
+	}
+}
+
 func TestParseSaveLastArgs(t *testing.T) {
 	if o, err := parseArgs([]string{"--save-last"}); err != nil || !o.saveLast {
 		t.Errorf("parseArgs(--save-last) = %+v, %v", o, err)

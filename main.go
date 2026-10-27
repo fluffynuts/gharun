@@ -55,6 +55,7 @@ import (
 
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/term"
 	"github.com/mattn/go-isatty"
 )
 
@@ -122,14 +123,20 @@ func versionString() string {
 }
 
 type workflowRun struct {
-	DatabaseID   int64     `json:"databaseId"`
-	Status       string    `json:"status"`
-	Conclusion   string    `json:"conclusion"`
-	URL          string    `json:"url"`
-	WorkflowName string    `json:"workflowName"`
-	CreatedAt    time.Time `json:"createdAt"`
-	StartedAt    time.Time `json:"startedAt"`
-	UpdatedAt    time.Time `json:"updatedAt"`
+	DatabaseID   int64         `json:"databaseId"`
+	Status       string        `json:"status"`
+	Conclusion   string        `json:"conclusion"`
+	URL          string        `json:"url"`
+	WorkflowName string        `json:"workflowName"`
+	CreatedAt    time.Time     `json:"createdAt"`
+	StartedAt    time.Time     `json:"startedAt"`
+	UpdatedAt    time.Time     `json:"updatedAt"`
+	Jobs         []workflowJob `json:"jobs"`
+}
+
+type workflowJob struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
 }
 
 func main() {
@@ -1259,10 +1266,11 @@ type pollResult struct {
 }
 
 // watch polls the run every statePollInterval until it completes. Meanwhile a
-// one-second tick redraws a single status line ("[00:31] in_progress") so the
-// clock keeps moving even though polls are slow; polls run in the background
-// so they never stall it. When stdout isn't a terminal, a line is printed only
-// when the status changes.
+// one-second tick redraws a single status line ("[00:31] running: 1/3 jobs
+// done; build in progress", see runProgress), cut to the terminal's width, so
+// the clock keeps moving even though polls are slow; polls run in the
+// background so they never stall it. When stdout isn't a terminal, a line is
+// printed only when the status changes.
 func watch(id int64) int {
 	idStr := fmt.Sprintf("%d", id)
 	started := time.Now()
@@ -1275,8 +1283,17 @@ func watch(id int64) int {
 	// (by GitHub's timestamps, corrected for our clock's skew from GitHub's).
 	skew := githubNow().Sub(time.Now())
 	var runStart, runEnd time.Time
+	var current *workflowRun
 	render := func() {
-		line := fmt.Sprintf("[%s] %s%s", formatClock(clockElapsed(started, time.Now(), skew, runStart, runEnd)), status, note)
+		clock := "[" + formatClock(clockElapsed(started, time.Now(), skew, runStart, runEnd)) + "] "
+		if current != nil {
+			width := 0
+			if live {
+				width = lineBudget(terminalWidth(), clock+note)
+			}
+			status, _ = runProgress(*current, width)
+		}
+		line := clock + status + note
 		if live {
 			fmt.Print("\r\x1b[2K" + dim.Render(line))
 		} else if status != lastPrinted {
@@ -1297,7 +1314,7 @@ func watch(id int64) int {
 	poll := func() {
 		polling = true
 		go func() {
-			out, err := ghOutput("run", "view", idStr, "--json", "status,conclusion,url,workflowName,startedAt,updatedAt")
+			out, err := ghOutput("run", "view", idStr, "--json", "status,conclusion,url,workflowName,startedAt,updatedAt,jobs")
 			var r workflowRun
 			if err == nil {
 				if jerr := json.Unmarshal([]byte(out), &r); jerr != nil {
@@ -1337,8 +1354,9 @@ func watch(id int64) int {
 			errorCount = 0
 			note = ""
 			r := res.run
-			status = r.Status
-			if (r.Status == "in_progress" || r.Status == "completed") && !r.StartedAt.IsZero() {
+			current = &r
+			_, runStarted := runProgress(r, 0)
+			if (runStarted || r.Status == "completed") && !r.StartedAt.IsZero() {
 				runStart = r.StartedAt
 			}
 			if r.Status == "completed" {
@@ -1365,6 +1383,74 @@ func watch(id int64) int {
 			return 1
 		}
 	}
+}
+
+// runProgress describes run for the status line, and reports whether it has
+// started. GitHub's own status for a run stays "queued" while any job waits
+// for a runner, however much of the run has finished, so once a job has
+// started this goes by the jobs instead: "running: 3/4 jobs done; test
+// waiting for a runner". width, when not 0, is the most it may take up:
+// jobs that don't fit become "+N more".
+func runProgress(r workflowRun, width int) (string, bool) {
+	done := 0
+	started := r.Status == "in_progress"
+	var active []string
+	for _, j := range r.Jobs {
+		switch j.Status {
+		case "completed":
+			done++
+			started = true
+		case "in_progress":
+			started = true
+			active = append(active, j.Name+" in progress")
+		case "queued":
+			active = append(active, j.Name+" waiting for a runner")
+		case "waiting":
+			active = append(active, j.Name+" waiting for approval")
+		default:
+			active = append(active, j.Name+" "+j.Status)
+		}
+	}
+	if r.Status == "completed" || !started {
+		return r.Status, started
+	}
+	if len(r.Jobs) == 0 {
+		return "running", true
+	}
+
+	text := fmt.Sprintf("running: %d/%d jobs done", done, len(r.Jobs))
+	for i, a := range active {
+		next := text + "; " + a
+		more := ""
+		if left := len(active) - i - 1; left > 0 {
+			more = fmt.Sprintf("; +%d more", left)
+		}
+		if width > 0 && lipgloss.Width(next+more) > width {
+			return text + fmt.Sprintf("; +%d more", len(active)-i), true
+		}
+		text = next
+	}
+	return text, true
+}
+
+// lineBudget is how much of a terminal width wide is left for the status
+// once used is on the line, keeping clear of the last column, which would
+// wrap the line and break redrawing it in place. 0 (no limit) when the width
+// isn't known.
+func lineBudget(wide int, used string) int {
+	if wide <= 0 {
+		return 0
+	}
+	return max(wide-lipgloss.Width(used)-1, 1)
+}
+
+// terminalWidth is stdout's width in columns, or 0 when it isn't known.
+func terminalWidth() int {
+	w, _, err := term.GetSize(os.Stdout.Fd())
+	if err != nil {
+		return 0
+	}
+	return w
 }
 
 // clockElapsed is what the status line's clock shows: the time since watching
